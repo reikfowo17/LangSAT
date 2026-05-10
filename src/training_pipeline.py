@@ -19,7 +19,7 @@ from stable_baselines3.common.monitor import Monitor
 from smartsat_env import SmartSATEnv
 
 # Đường dẫn cho Kaggle — thay đổi nếu dùng môi trường khác
-DATA_DIR    = "/kaggle/input/uf20-91"          # Dataset location
+DATA_DIR    = "/kaggle/input/datasets/heon29/uf20-91"          # Dataset location
 OUTPUT_DIR  = "/kaggle/working/results"         # Kết quả output
 MODEL_PATH  = "/kaggle/working/results/smartsat_model"
 
