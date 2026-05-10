@@ -18,27 +18,21 @@ from sympy import symbols
 LOGIC_GRAMMAR = r"""
     ?start: expr
 
-    ?expr: equiv
-    ?equiv: implies
-          | equiv "Equivalent(" implies "," implies ")" -> equivalent
+    ?expr: or_expr
+         | and_expr
+         | not_expr
+         | implies_expr
+         | equiv_expr
+         | atom
 
-    ?implies: or_expr
-            | "Implies(" or_expr "," or_expr ")"        -> implies
+    or_expr     : "Or("         expr "," expr ")"
+    and_expr    : "And("        expr "," expr ")"
+    not_expr    : "Not("        expr ")"
+    implies_expr: "Implies("    expr "," expr ")"
+    equiv_expr  : "Equivalent(" expr "," expr ")"
 
-    ?or_expr: and_expr
-            | "Or(" args ")"                             -> or_expr
-
-    ?and_expr: not_expr
-             | "And(" args ")"                           -> and_expr
-
-    ?not_expr: atom
-             | "Not(" atom ")"                           -> not_expr
-
-    ?atom: NAME                                          -> var
-
-    args: expr ("," expr)*
-
-    NAME: /[A-Za-z][A-Za-z0-9_]*/
+    atom : NAME                                          -> var
+    NAME : /[A-Za-z][A-Za-z0-9_]*/
 
     %ignore " "
     %ignore "\t"
@@ -64,21 +58,16 @@ class LogicTransformer(Transformer):
         return Not(items[0])
 
     def or_expr(self, items):
-        args = items[0] if isinstance(items[0], list) else items
-        return Or(*args)
+        return Or(items[0], items[1])
 
     def and_expr(self, items):
-        args = items[0] if isinstance(items[0], list) else items
-        return And(*args)
+        return And(items[0], items[1])
 
-    def implies(self, items):
+    def implies_expr(self, items):
         return Implies(items[0], items[1])
 
-    def equivalent(self, items):
+    def equiv_expr(self, items):
         return Equivalent(items[0], items[1])
-
-    def args(self, items):
-        return list(items)
 
 class Lang2Logic:
 
@@ -87,16 +76,27 @@ class Lang2Logic:
 
 Rules:
 1. Use ONLY these operators: Or(X, Y), And(X, Y), Not(X), Implies(X, Y), Equivalent(X, Y)
-2. Use single uppercase letters or short names as variables (P, Q, R, S, ...).
-3. Use the SAME variable name if the same proposition appears in multiple sentences.
-4. Output ONLY the logical expression, nothing else. No explanation, no markdown.
+2. Use single uppercase letters as variables (A, B, C, ...).
+3. Output EXACTLY two lines, no extra text:
+   Line 1: the logical expression
+   Line 2: mapping of every variable used, format: X="proposition", Y="proposition"
+4. No explanation, no markdown.
 
 Examples:
-- "A or B" → Or(A, B)
-- "If A then B" → Implies(A, B)
-- "A if and only if B" → Equivalent(A, B)
-- "Not A and B" → And(Not(A), B)
-- "A or B, and C" → And(Or(A, B), C)
+Input: "A or B"
+Output:
+Or(A, B)
+A="A", B="B"
+
+Input: "If A then B"
+Output:
+Implies(A, B)
+A="A", B="B"
+
+Input: "Not A and B"
+Output:
+And(Not(A), B)
+A="A", B="B"
 """
 
     def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4o-mini"):
@@ -105,6 +105,7 @@ Examples:
         self._client = None
         self._parser = Lark(LOGIC_GRAMMAR, parser="earley", ambiguity="resolve")
         self._var_map: dict = {}
+        self._meaning_map: dict = {}   # tên biến → nghĩa tiếng Anh
         self._api_cost_tokens = 0   # tracking token usage
 
     def _get_client(self):
@@ -128,21 +129,40 @@ Examples:
 
     # ---- Step 2: NL → Logical Expression ----
 
+    def _parse_mapping_line(self, line: str):
+        # parse: A="proposition", B="proposition"
+        for match in re.finditer(r'([A-Za-z][A-Za-z0-9_]*)\s*=\s*"([^"]*)"', line):
+            var, meaning = match.group(1), match.group(2)
+            if var not in self._meaning_map:
+                self._meaning_map[var] = meaning
+
     def nl_to_logical(self, sentence: str) -> str:
         client = self._get_client()
+        var_context = ""
+        if self._meaning_map:
+            entries = ", ".join(f'{k}="{v}"' for k, v in self._meaning_map.items())
+            var_context = (
+                f"\nAlready assigned variables: {entries}"
+                "\nReuse these exact letters for the SAME proposition."
+                "\nUse a NEW letter for any proposition not listed above."
+            )
         try:
             response = client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": self.SYSTEM_PROMPT},
+                    {"role": "system", "content": self.SYSTEM_PROMPT + var_context},
                     {"role": "user", "content": f'Sentence: "{sentence}"'},
                 ],
                 temperature=0,       # deterministic output
                 max_tokens=200,
             )
-            expr_str = response.choices[0].message.content.strip()
+            raw = response.choices[0].message.content.strip()
             # Track token usage
             self._api_cost_tokens += response.usage.total_tokens
+            lines = [l.strip() for l in raw.splitlines() if l.strip()]
+            expr_str = lines[0] if lines else ""
+            if len(lines) >= 2:
+                self._parse_mapping_line(lines[1])
             return expr_str
         except Exception as e:
             print(f"  [API Error] {e}")
@@ -185,7 +205,8 @@ Examples:
     # ---- Full Pipeline ----
 
     def convert(self, text: str, verbose: bool = True) -> dict:
-        self._var_map = {}   # reset variable map cho mỗi input mới
+        self._var_map = {}       # reset variable map cho mỗi input mới
+        self._meaning_map = {}   # reset meaning map cho mỗi input mới
 
         # Step 1: Tokenize
         sentences = self.tokenize(text)
@@ -237,11 +258,14 @@ Examples:
         n_clauses = final_cnf.count("&") + 1 if final_cnf else 0
 
         if verbose:
+            print("\n")
             print(f"  Final CNF (Simplified):")
             print(f"  {final_cnf}")
             print(f"  Variables ({len(variables)}): {variables}")
+            print(f"  Meanings: { {k: v for k, v in self._meaning_map.items()} }")
             print(f"  Clauses (approx): {n_clauses}")
             print(f"  API tokens used: {self._api_cost_tokens}")
+            print("\n")
 
         return {
             "sentences"            : sentences,
@@ -249,6 +273,7 @@ Examples:
             "cnf_per_sentence"     : cnf_per_sent,
             "final_cnf"            : final_cnf,
             "variables"            : variables,
+            "meanings"             : dict(self._meaning_map),
             "n_clauses"            : n_clauses,
             "api_tokens_used"      : self._api_cost_tokens,
         }
