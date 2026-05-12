@@ -3,7 +3,6 @@ import sys
 import glob
 import time
 import json
-import pickle
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -13,23 +12,38 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.callbacks import BaseCallback, EvalCallback
+from stable_baselines3.common.callbacks import BaseCallback
 from stable_baselines3.common.monitor import Monitor
 
 from smartsat_env import SmartSATEnv
 
-# Đường dẫn cho Kaggle — thay đổi nếu dùng môi trường khác
-DATA_DIR    = "/kaggle/input/datasets/heon29/uf20-91"          # Dataset location
-OUTPUT_DIR  = "/kaggle/working/results"         # Kết quả output
-MODEL_PATH  = "/kaggle/working/results/smartsat_model"
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_IS_KAGGLE = os.path.exists("/kaggle/working")
+
+DATA_DIR   = os.environ.get("LANGSAT_DATA_DIR",
+    "/kaggle/input/datasets/heon29/uf20-91" if _IS_KAGGLE else os.path.join(_ROOT, "data"))
+OUTPUT_DIR = os.environ.get("LANGSAT_OUTPUT_DIR",
+    "/kaggle/working/results" if _IS_KAGGLE else os.path.join(_ROOT, "results"))
+MODEL_PATH = os.environ.get("LANGSAT_MODEL_PATH", os.path.join(OUTPUT_DIR, "smartsat_model"))
 
 LEARNING_RATE  = 0.0002
-TOTAL_STEPS    = 100_000          # 1 epoch theo bài báo
+TOTAL_STEPS    = int(os.environ.get("LANGSAT_TOTAL_STEPS", "100000"))  # 1 epoch theo bài báo
 TRAIN_RATIO    = 0.8              # 800 train / 200 test
 SEED           = 42
 CHECKPOINT_FREQ = 10_000          # Lưu checkpoint mỗi 10k steps
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def set_reproducible_seeds(seed: int = SEED):
+    np.random.seed(seed)
+    try:
+        import torch
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
 
 def load_and_split_dataset(data_dir: str, train_ratio: float = 0.8):
     files = sorted(glob.glob(os.path.join(data_dir, "*.cnf")))
@@ -94,6 +108,7 @@ class RewardLoggerCallback(BaseCallback):
         print(f"[Log] Reward log saved → {path}")
 
 def train_smartsat(train_files: list[str]) -> tuple:
+    set_reproducible_seeds(SEED)
     print(" TRAINING SmartSAT")
     print(f"  Learning rate : {LEARNING_RATE}")
     print(f"  Total steps   : {TOTAL_STEPS:,}")
