@@ -1,8 +1,12 @@
+import os
+import sys
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 from typing import Optional
 
+# Đảm bảo import được từ cùng thư mục src/
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cdcl_baseline import SATInstance, CDCLSolver
 
 def extract_sat_features(filepath: str, n_features: int = 48) -> np.ndarray:
@@ -21,7 +25,41 @@ def extract_sat_features(filepath: str, n_features: int = 48) -> np.ndarray:
         arr = arr / (np.abs(arr).max() + 1e-8)
         return arr.astype(np.float32)
     except Exception:
-        return np.zeros(n_features, dtype=np.float32)
+        inst = SATInstance.from_dimacs(filepath)
+        pos = np.zeros(inst.n_vars + 1, dtype=np.float32)
+        neg = np.zeros(inst.n_vars + 1, dtype=np.float32)
+        clause_lengths = []
+        for clause in inst.clauses:
+            clause_lengths.append(len(clause))
+            for lit in clause:
+                if lit > 0:
+                    pos[lit] += 1
+                else:
+                    neg[-lit] += 1
+
+        total_lits = float(sum(clause_lengths) or 1)
+        base = np.array([
+            inst.n_vars,
+            inst.n_clauses,
+            inst.n_clauses / max(inst.n_vars, 1),
+            np.mean(clause_lengths) if clause_lengths else 0.0,
+            np.std(clause_lengths) if clause_lengths else 0.0,
+            np.min(clause_lengths) if clause_lengths else 0.0,
+            np.max(clause_lengths) if clause_lengths else 0.0,
+            pos.sum() / total_lits,
+            neg.sum() / total_lits,
+        ], dtype=np.float32)
+        per_var = np.concatenate([
+            (pos[1:] + neg[1:]) / total_lits,
+            (pos[1:] - neg[1:]) / total_lits,
+        ]).astype(np.float32)
+        arr = np.concatenate([base, per_var])
+        if len(arr) >= n_features:
+            arr = arr[:n_features]
+        else:
+            arr = np.pad(arr, (0, n_features - len(arr)))
+        arr = arr / (np.abs(arr).max() + 1e-8)
+        return arr.astype(np.float32)
 
 N_VARS    = 20
 N_CLAUSES = 91
@@ -54,7 +92,10 @@ class SmartSATEnv(gym.Env):
         self._solver: Optional[CDCLSolver] = None
         self._filepath: Optional[str] = None
         self._done = False
+        self._step_count = 0
+        self._max_steps = N_VARS * 2   # Tối đa 40 steps, tránh episode chạy vô hạn
         self._global_features = np.zeros(N_GLOBAL, dtype=np.float32)
+        self.preferred_literals: list[int] = []
 
     # ---- Helpers ----
 
@@ -86,12 +127,14 @@ class SmartSATEnv(gym.Env):
                 clause_eval[ci] = 0.0
 
         # Bipartite graph (clause × var)
+        # Bipartite graph — GIỮ POLARITY theo bài báo Section 3.2.2:
+        # "Positive and negative literals are treated distinctly to preserve clause polarity"
         graph = np.zeros((N_CLAUSES, n), dtype=np.float32)
         for ci, clause in enumerate(solver.clauses[:N_CLAUSES]):
             for lit in clause:
                 vi = abs(lit) - 1
                 if 0 <= vi < n:
-                    graph[ci, vi] = 1.0
+                    graph[ci, vi] = 1.0 if lit > 0 else -1.0
 
         obs = np.concatenate([
             var_assign,
@@ -121,9 +164,11 @@ class SmartSATEnv(gym.Env):
         self.current_file_idx += 1
         self._load_instance(filepath)
         self._done = False
+        self._step_count = 0
+        self.preferred_literals = []
 
         # Unit propagation ban đầu (level 0)
-        self._solver.unit_propagate()
+        self._solver._find_initial_units()
 
         obs = self._get_obs()
         return obs, {}
@@ -150,14 +195,19 @@ class SmartSATEnv(gym.Env):
                 return self._get_obs(), reward, True, False, {"sat": sat}
             var = unassigned[0]
 
+        lit = var if value == 1 else -var
+        if lit not in self.preferred_literals and -lit not in self.preferred_literals:
+            self.preferred_literals.append(lit)
+
         # Apply assignment
         solver.current_level += 1
         solver.trail_lim.append(len(solver.trail))
-        solver._assign(var, value, solver.current_level, antecedent=None)
+        solver._enqueue(var, value, solver.current_level, reason=None)
 
         # BCP
         conflict_ci = solver.unit_propagate()
 
+        self._step_count += 1
         terminated = False
         truncated  = False
 
@@ -170,6 +220,7 @@ class SmartSATEnv(gym.Env):
 
             learned, btlevel = solver.analyze_conflict(conflict_ci)
             solver.backtrack(btlevel)
+            ci_new = len(solver.clauses)
             solver.clauses.append(learned)
 
             # Force unit nếu learned clause đơn
@@ -178,8 +229,7 @@ class SmartSATEnv(gym.Env):
                 v2 = abs(unit_lit)
                 val2 = 1 if unit_lit > 0 else -1
                 if solver.assignment[v2] == 0:
-                    solver._assign(v2, val2, solver.current_level,
-                                   len(solver.clauses) - 1)
+                    solver._enqueue(v2, val2, solver.current_level, ci_new)
                     conflict_ci2 = solver.unit_propagate()
                     if conflict_ci2 is not None:
                         self._done = True
@@ -193,6 +243,14 @@ class SmartSATEnv(gym.Env):
             return self._get_obs(), reward, True, False, {"sat": True}
 
         reward = self._compute_reward()
+
+        # Truncation: episode quá dài → dừng lại
+        if self._step_count >= self._max_steps:
+            return self._get_obs(), reward, False, True, {
+                "truncated": True,
+                "preferred_literals": list(self.preferred_literals),
+            }
+
         return self._get_obs(), reward, False, False, {}
 
     def _check_sat(self) -> bool:

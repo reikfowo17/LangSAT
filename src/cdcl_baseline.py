@@ -1,7 +1,8 @@
 
 import time
-from collections import defaultdict
+from dataclasses import dataclass
 from typing import Optional
+
 
 class SATInstance:
     def __init__(self, n_vars: int, clauses: list[list[int]]):
@@ -23,7 +24,7 @@ class SATInstance:
                     parts = line.split()
                     n_vars = int(parts[2])
                     continue
-                lits = list(map(int, line.split()))
+                lits = [int(x) for x in line.split()]
                 if lits and lits[-1] == 0:
                     lits = lits[:-1]
                 if lits:
@@ -43,7 +44,7 @@ class VSIDS:
             self.bump_amount *= 1e-100
 
     def decay_all(self):
-        self.activity = [a * self.decay for a in self.activity]
+        self.bump_amount /= self.decay
 
     def pick(self, unassigned: list[int]) -> int:
         return max(unassigned, key=lambda v: self.activity[v])
@@ -60,17 +61,53 @@ class CDCLSolver:
         self.clauses = [list(c) for c in instance.clauses]
         self.vsids = VSIDS(n)
         self.current_level = 0
+        self.stats = SolveStats()
 
     def _lit_value(self, lit: int) -> int:
         val = self.assignment[abs(lit)]
         if val == 0: return 0
         return val if lit > 0 else -val
 
-    def _assign(self, var: int, value: int, level: int, antecedent=None):
+    def _enqueue(self, var: int, value: int, level: int, reason: Optional[int] = None):
+        current = self.assignment[var]
+        if current != 0 and current != value:
+            raise ValueError(f"Contradictory assignment for variable {var}")
+        if current == value:
+            return
         self.assignment[var] = value
         self.decision_level[var] = level
-        self.antecedent[var] = antecedent
-        self.trail.append((var, value))
+        self.antecedent[var] = reason
+        self.trail.append(var)
+
+    def _snapshot(self) -> tuple[list[int], list[int], list[Optional[int]], list[int], list[int], int]:
+        return (
+            self.assignment[:],
+            self.decision_level[:],
+            self.antecedent[:],
+            self.trail[:],
+            self.trail_lim[:],
+            self.current_level,
+        )
+
+    def _restore(self, snap):
+        (
+            self.assignment,
+            self.decision_level,
+            self.antecedent,
+            self.trail,
+            self.trail_lim,
+            self.current_level,
+        ) = snap
+
+    def _clause_state(self, clause: list[int]) -> tuple[bool, list[int]]:
+        unassigned = []
+        for lit in clause:
+            val = self._lit_value(lit)
+            if val == 1:
+                return True, []
+            if val == 0:
+                unassigned.append(lit)
+        return False, unassigned
 
     def unit_propagate(self) -> Optional[int]:
         while True:
@@ -136,10 +173,10 @@ class CDCLSolver:
         return learned, btlevel
 
     def backtrack(self, level: int):
-        while self.trail and self.decision_level[self.trail[-1][0]] > level:
-            var, _ = self.trail.pop()
+        while self.trail and self.decision_level[self.trail[-1]] > level:
+            var = self.trail.pop()
             self.assignment[var] = 0
-            self.decision_level[var] = 0
+            self.decision_level[var] = -1
             self.antecedent[var] = None
         self.current_level = level
 
@@ -173,10 +210,10 @@ class CDCLSolver:
                 lit = learned[0]
                 self._assign(abs(lit), 1 if lit > 0 else -1, self.current_level, len(self.clauses)-1)
 
-def solve_file(filepath: str) -> tuple[bool, float]:
+def solve_file(filepath: str, preferred_literals: Optional[list[int]] = None) -> tuple[bool, float]:
     inst = SATInstance.from_dimacs(filepath)
     solver = CDCLSolver(inst)
-    return solver.solve()
+    return solver.solve(preferred_literals=preferred_literals)
 
 if __name__ == "__main__":
     import sys
