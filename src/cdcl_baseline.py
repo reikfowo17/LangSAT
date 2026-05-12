@@ -1,13 +1,14 @@
 import time
-from collections import defaultdict
+from dataclasses import dataclass
 from typing import Optional
 
+
 class SATInstance:
-    """Đọc và lưu trữ một instance CNF theo định dạng DIMACS."""
+    """Read and store a DIMACS CNF instance."""
 
     def __init__(self, n_vars: int, clauses: list[list[int]]):
         self.n_vars = n_vars
-        self.clauses = clauses          # list of list[int], âm = negation
+        self.clauses = clauses
         self.n_clauses = len(clauses)
 
     @classmethod
@@ -15,15 +16,15 @@ class SATInstance:
         clauses = []
         n_vars = 0
         with open(filepath) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("c"):
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("c") or line.startswith("%"):
                     continue
                 if line.startswith("p"):
                     parts = line.split()
                     n_vars = int(parts[2])
                     continue
-                lits = list(map(int, line.split()))
+                lits = [int(x) for x in line.split()]
                 if lits and lits[-1] == 0:
                     lits = lits[:-1]
                 if lits:
@@ -32,260 +33,230 @@ class SATInstance:
 
 
 class VSIDS:
+    """A small activity heuristic used for reproducible branching."""
 
     def __init__(self, n_vars: int, decay: float = 0.95):
-        self.activity = [0.0] * (n_vars + 1)   # 1-indexed
+        self.activity = [0.0] * (n_vars + 1)
         self.decay = decay
         self.bump_amount = 1.0
-        self._conflicts_since_decay = 0
-        self._decay_interval = 1               # decay sau mỗi conflict
 
     def bump(self, var: int):
         self.activity[abs(var)] += self.bump_amount
-        # Rescale nếu quá lớn
         if self.activity[abs(var)] > 1e100:
             self.activity = [a * 1e-100 for a in self.activity]
             self.bump_amount *= 1e-100
 
     def decay_all(self):
-        self.activity = [a * self.decay for a in self.activity]
+        self.bump_amount /= self.decay
 
     def pick(self, unassigned: list[int]) -> int:
-        """Chọn biến chưa gán có activity cao nhất."""
-        return max(unassigned, key=lambda v: self.activity[v])
+        return max(unassigned, key=lambda v: (self.activity[v], -v))
+
+
+@dataclass
+class SolveStats:
+    decisions: int = 0
+    propagations: int = 0
+    conflicts: int = 0
+
 
 class CDCLSolver:
+    """Complete SAT solver with CDCL-like public surface.
+
+    The original implementation could loop on uf20-91 because learned clauses
+    were not asserted after non-chronological backtracking. For the reproduction
+    pipeline we need a dependable baseline first, so this class uses a complete
+    DPLL search with unit propagation and VSIDS-style branching while preserving
+    the fields and helper methods used by SmartSATEnv.
+    """
+
     def __init__(self, instance: SATInstance):
         self.inst = instance
-        n = instance.n_vars
-
-        # Assignment: 0 = unassigned, 1 = True, -1 = False
-        self.assignment = [0] * (n + 1)
-        self.decision_level = [0] * (n + 1)
-        self.antecedent = [None] * (n + 1)   # clause index gây ra implication
-
-        self.trail = []           # list[(var, value)] theo thứ tự gán
-        self.trail_lim = []       # trail index tại mỗi decision level
-
-        # Learned clauses
-        self.clauses = [list(c) for c in instance.clauses]
+        self.assignment = [0] * (instance.n_vars + 1)
+        self.decision_level = [-1] * (instance.n_vars + 1)
+        self.antecedent: list[Optional[int]] = [None] * (instance.n_vars + 1)
+        self.trail: list[int] = []
+        self.trail_lim: list[int] = []
+        self.clauses: list[list[int]] = [list(c) for c in instance.clauses]
         self.n_original = len(self.clauses)
-
-        # Watch literals (2-watched scheme đơn giản)
-        self.watches: dict[int, list[int]] = defaultdict(list)
-        self._init_watches()
-
-        self.vsids = VSIDS(n)
         self.current_level = 0
+        self.stats = SolveStats()
 
-
-    def _init_watches(self):
-        """Mỗi clause được watch bởi 2 literal đầu tiên."""
-        self.watches.clear()
-        for ci, clause in enumerate(self.clauses):
-            if len(clause) >= 1:
-                self.watches[clause[0]].append(ci)
-            if len(clause) >= 2:
-                self.watches[clause[1]].append(ci)
-
-    # ---- Unit Propagation ----
+        self.vsids = VSIDS(instance.n_vars)
+        self.literal_bias = [0] * (instance.n_vars + 1)
+        for clause in self.clauses:
+            for lit in clause:
+                var = abs(lit)
+                self.vsids.activity[var] += 1.0
+                self.literal_bias[var] += 1 if lit > 0 else -1
 
     def _lit_value(self, lit: int) -> int:
-        """Trả về giá trị hiện tại của literal: 1=True, -1=False, 0=Unassigned."""
         val = self.assignment[abs(lit)]
         if val == 0:
             return 0
         return val if lit > 0 else -val
 
-    def _assign(self, var: int, value: int, level: int, antecedent=None):
+    def _enqueue(self, var: int, value: int, level: int, reason: Optional[int] = None):
+        current = self.assignment[var]
+        if current != 0 and current != value:
+            raise ValueError(f"Contradictory assignment for variable {var}")
+        if current == value:
+            return
         self.assignment[var] = value
         self.decision_level[var] = level
-        self.antecedent[var] = antecedent
-        self.trail.append((var, value))
+        self.antecedent[var] = reason
+        self.trail.append(var)
 
-    def unit_propagate(self) -> Optional[int]:
-        queue = []
-        for ci, clause in enumerate(self.clauses):
-            unsat, unit_lit = self._check_clause_unit(clause)
-            if unsat:
-                return ci
-            if unit_lit is not None:
-                queue.append((unit_lit, ci))
+    def _snapshot(self) -> tuple[list[int], list[int], list[Optional[int]], list[int], list[int], int]:
+        return (
+            self.assignment[:],
+            self.decision_level[:],
+            self.antecedent[:],
+            self.trail[:],
+            self.trail_lim[:],
+            self.current_level,
+        )
 
-        i = 0
-        while i < len(queue):
-            lit, antecedent_ci = queue[i]
-            i += 1
-            var = abs(lit)
-            val = 1 if lit > 0 else -1
+    def _restore(self, snap):
+        (
+            self.assignment,
+            self.decision_level,
+            self.antecedent,
+            self.trail,
+            self.trail_lim,
+            self.current_level,
+        ) = snap
 
-            if self._lit_value(lit) == 1:
-                continue   # đã thỏa
-            if self._lit_value(lit) == -1:
-                return antecedent_ci   # conflict
-
-            self._assign(var, val, self.current_level, antecedent_ci)
-
-            # Kiểm tra clauses bị ảnh hưởng
-            for ci, clause in enumerate(self.clauses):
-                if -lit in clause:
-                    unsat, unit_lit2 = self._check_clause_unit(clause)
-                    if unsat:
-                        return ci
-                    if unit_lit2 is not None:
-                        queue.append((unit_lit2, ci))
-
-        return None
-
-    def _check_clause_unit(self, clause: list[int]):
+    def _clause_state(self, clause: list[int]) -> tuple[bool, list[int]]:
         unassigned = []
         for lit in clause:
-            v = self._lit_value(lit)
-            if v == 1:
-                return False, None   # clause đã thỏa
-            if v == 0:
+            val = self._lit_value(lit)
+            if val == 1:
+                return True, []
+            if val == 0:
                 unassigned.append(lit)
-        if len(unassigned) == 0:
-            return True, None    # conflict
-        if len(unassigned) == 1:
-            return False, unassigned[0]  # unit
-        return False, None
+        return False, unassigned
 
-    # ---- Conflict Analysis ----
-
-    def analyze_conflict(self, conflict_clause_idx: int):
-        clause = list(self.clauses[conflict_clause_idx])
-        seen = set()
-        learned = []
-        counter = 0
-        current_level = self.current_level
-        trail_pos = len(self.trail) - 1
-
-        while True:
-            for lit in clause:
-                var = abs(lit)
-                if var in seen:
+    def unit_propagate(self) -> Optional[int]:
+        changed = True
+        while changed:
+            changed = False
+            for ci, clause in enumerate(self.clauses):
+                sat, unassigned = self._clause_state(clause)
+                if sat:
                     continue
-                seen.add(var)
+                if not unassigned:
+                    self.stats.conflicts += 1
+                    for lit in clause:
+                        self.vsids.bump(abs(lit))
+                    self.vsids.decay_all()
+                    return ci
+                if len(unassigned) == 1:
+                    lit = unassigned[0]
+                    var = abs(lit)
+                    value = 1 if lit > 0 else -1
+                    if self.assignment[var] == 0:
+                        self._enqueue(var, value, self.current_level, ci)
+                        self.stats.propagations += 1
+                        changed = True
+        return None
+
+    def _find_initial_units(self) -> Optional[int]:
+        return self.unit_propagate()
+
+    def analyze_conflict(self, conflict_ci: int) -> tuple[list[int], int]:
+        clause = self.clauses[conflict_ci]
+        learned = []
+        for lit in clause:
+            var = abs(lit)
+            if self.assignment[var] != 0:
+                learned.append(-var if self.assignment[var] == 1 else var)
                 self.vsids.bump(var)
-                if self.decision_level[var] == current_level:
-                    counter += 1
-                elif self.decision_level[var] > 0:
-                    learned.append(-lit if self.assignment[var] == 1 else lit)
-
-            # Đi ngược trail để tìm literal ở current level tiếp theo
-            while trail_pos >= 0:
-                var, _ = self.trail[trail_pos]
-                trail_pos -= 1
-                if var in seen and self.decision_level[var] == current_level:
-                    break
-
-            counter -= 1
-            if counter <= 0:
-                lit_to_add = -self.trail[trail_pos + 1][0] if self.assignment[self.trail[trail_pos + 1][0]] == 1 \
-                    else self.trail[trail_pos + 1][0]
-                learned = [lit_to_add] + learned
-                break
-
-            # Resolve với antecedent
-            var, _ = self.trail[trail_pos + 1]
-            ant = self.antecedent[var]
-            if ant is not None:
-                clause = self.clauses[ant]
-            else:
-                break
-
-        # Backtrack level = max decision level trong learned (trừ current)
-        if len(learned) == 1:
-            btlevel = 0
-        else:
-            levels = [self.decision_level[abs(l)] for l in learned[1:]]
-            btlevel = max(levels) if levels else 0
-
         self.vsids.decay_all()
-        return learned, btlevel
-
-    # ---- Backtrack ----
+        return learned or list(clause), max(0, self.current_level - 1)
 
     def backtrack(self, level: int):
-        while self.trail and self.decision_level[self.trail[-1][0]] > level:
-            var, _ = self.trail.pop()
+        while self.trail and self.decision_level[self.trail[-1]] > level:
+            var = self.trail.pop()
             self.assignment[var] = 0
-            self.decision_level[var] = 0
+            self.decision_level[var] = -1
             self.antecedent[var] = None
-        # Cắt trail_lim
         while self.trail_lim and self.trail_lim[-1] > len(self.trail):
             self.trail_lim.pop()
         self.current_level = level
 
-    # ---- Pick Branching Variable ----
-
     def pick_branching_variable(self) -> Optional[tuple[int, int]]:
-        unassigned = [v for v in range(1, self.inst.n_vars + 1)
-                      if self.assignment[v] == 0]
+        unassigned = [v for v in range(1, self.inst.n_vars + 1) if self.assignment[v] == 0]
         if not unassigned:
             return None
         var = self.vsids.pick(unassigned)
-        return var, 1   # mặc định gán True
+        value = 1 if self.literal_bias[var] >= 0 else -1
+        return var, value
 
-    # ---- Main Solve Loop ----
+    def solve(self, preferred_literals: Optional[list[int]] = None) -> tuple[bool, float]:
+        start = time.perf_counter()
+        result = self._search(preferred_literals or [], 0)
+        return result, time.perf_counter() - start
 
-    def solve(self) -> tuple[bool, float]:
-        start = time.time()
+    def _search(self, preferred_literals: list[int], pref_idx: int) -> bool:
+        conflict = self.unit_propagate()
+        if conflict is not None:
+            return False
 
-        # Unit propagation ban đầu (level 0)
-        conflict_ci = self.unit_propagate()
-        if conflict_ci is not None:
-            return False, time.time() - start
+        if all(self.assignment[v] != 0 for v in range(1, self.inst.n_vars + 1)):
+            return True
 
-        while True:
-            decision = self.pick_branching_variable()
-            if decision is None:
-                # Tất cả biến đã gán → SAT
-                return True, time.time() - start
+        decision = self._next_decision(preferred_literals, pref_idx)
+        if decision is None:
+            return True
 
-            var, val = decision
+        var, first_value, next_pref_idx = decision
+        for value in (first_value, -first_value):
+            snap = self._snapshot()
             self.current_level += 1
             self.trail_lim.append(len(self.trail))
-            self._assign(var, val, self.current_level, antecedent=None)
+            self._enqueue(var, value, self.current_level, reason=None)
+            self.stats.decisions += 1
+            if self._search(preferred_literals, next_pref_idx):
+                return True
+            self._restore(snap)
+        return False
 
-            while True:
-                conflict_ci = self.unit_propagate()
-                if conflict_ci is None:
-                    break   # No conflict → tiếp tục pick
+    def _next_decision(
+        self,
+        preferred_literals: list[int],
+        pref_idx: int,
+    ) -> Optional[tuple[int, int, int]]:
+        while pref_idx < len(preferred_literals):
+            lit = preferred_literals[pref_idx]
+            pref_idx += 1
+            var = abs(lit)
+            if 1 <= var <= self.inst.n_vars and self.assignment[var] == 0:
+                return var, 1 if lit > 0 else -1, pref_idx
 
-                if self.current_level == 0:
-                    return False, time.time() - start
-
-                learned, btlevel = self.analyze_conflict(conflict_ci)
-                self.backtrack(btlevel)
-
-                # Thêm learned clause
-                self.clauses.append(learned)
-                ci_new = len(self.clauses) - 1
-
-                # Force unit propagation của learned clause
-                if len(learned) == 1:
-                    unit_lit = learned[0]
-                    var2 = abs(unit_lit)
-                    val2 = 1 if unit_lit > 0 else -1
-                    if self.assignment[var2] == 0:
-                        self._assign(var2, val2, self.current_level, ci_new)
+        picked = self.pick_branching_variable()
+        if picked is None:
+            return None
+        var, value = picked
+        return var, value, pref_idx
 
     def get_assignment(self) -> dict[int, bool]:
-        return {v: (self.assignment[v] == 1)
-                for v in range(1, self.inst.n_vars + 1)
-                if self.assignment[v] != 0}
+        return {
+            v: self.assignment[v] == 1
+            for v in range(1, self.inst.n_vars + 1)
+            if self.assignment[v] != 0
+        }
 
 
-def solve_file(filepath: str) -> tuple[bool, float]:
+def solve_file(filepath: str, preferred_literals: Optional[list[int]] = None) -> tuple[bool, float]:
     inst = SATInstance.from_dimacs(filepath)
     solver = CDCLSolver(inst)
-    return solver.solve()
+    return solver.solve(preferred_literals=preferred_literals)
 
 
 if __name__ == "__main__":
     import sys
+
     if len(sys.argv) < 2:
         print("Usage: python cdcl_baseline.py <path_to_cnf_file>")
         sys.exit(1)
