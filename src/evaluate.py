@@ -28,7 +28,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 PAPER_MEDIAN_SECONDS = 1.02
 TIME_SCALE = float(os.environ.get("LANGSAT_TIME_SCALE", "1.0"))
 REPORT_SCALE_TO_PAPER = os.environ.get("LANGSAT_REPORT_SCALE_TO_PAPER", "0") == "1"
-SMARTSAT_POLICY_MODE = os.environ.get("LANGSAT_POLICY_MODE", "hybrid").lower()
+SMARTSAT_POLICY_MODE = os.environ.get("LANGSAT_POLICY_MODE", "rl").lower()
 SMARTSAT_USE_SEARCH_TIME = os.environ.get("LANGSAT_USE_SEARCH_TIME", "0") == "1"
 
 

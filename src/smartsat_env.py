@@ -68,6 +68,7 @@ def extract_sat_features(filepath: str, n_features: int = 48) -> np.ndarray:
 N_VARS    = 20
 N_CLAUSES = 91
 N_GLOBAL  = 48
+REWARD_MODE = os.environ.get("LANGSAT_REWARD_MODE", "paper").lower()
 
 OBS_SIZE = N_VARS + N_CLAUSES + N_VARS * N_CLAUSES + N_GLOBAL
 # 20 + 91 + 1820 + 48 = 1979
@@ -147,7 +148,9 @@ class SmartSATEnv(gym.Env):
         inst = SATInstance.from_dimacs(filepath)
         self._solver = CDCLSolver(inst)
         self._global_features = extract_sat_features(filepath, N_GLOBAL)
-        self._baseline_decisions = baseline_decisions(filepath)
+        self._baseline_decisions = (
+            baseline_decisions(filepath) if REWARD_MODE == "shaped" else N_VARS
+        )
 
     def _get_obs(self) -> np.ndarray:
         return build_solver_observation(self._solver, self._global_features)
@@ -161,9 +164,13 @@ class SmartSATEnv(gym.Env):
                 satisfied += 1
             elif all(v == -1 for v in vals):
                 unsatisfied += 1
+        if REWARD_MODE == "paper":
+            return float(satisfied - unsatisfied)
         return (satisfied / N_CLAUSES) - float(unsatisfied)
 
     def _terminal_reward(self, sat: bool) -> float:
+        if REWARD_MODE == "paper":
+            return self._compute_reward() if sat else -float(N_CLAUSES + self._step_count)
         if not sat:
             return -20.0 - self._step_count
         baseline = max(self._baseline_decisions, 1)
