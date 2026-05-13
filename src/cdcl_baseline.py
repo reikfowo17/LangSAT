@@ -1,6 +1,6 @@
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Callable, Optional
 
 
 class SATInstance:
@@ -58,15 +58,19 @@ class SolveStats:
     decisions: int = 0
     propagations: int = 0
     conflicts: int = 0
+    policy_calls: int = 0
+    learned_clauses: int = 0
+
+
+DecisionPolicy = Callable[["CDCLSolver"], Optional[tuple[int, int]]]
 
 
 class CDCLSolver:
-    """Complete SAT solver with a CDCL-like public interface.
+    """CDCL-style SAT solver with a pluggable decision policy.
 
-    The paper does not publish code, and a previous CDCL draft could loop on
-    uf20-91. For the reproduction notebook we use complete DPLL search with
-    unit propagation and VSIDS-style branching, while preserving the methods
-    SmartSATEnv expects.
+    Baseline uses the built-in VSIDS-style branching. SmartSAT evaluation uses
+    the same search loop and injects the PPO model only at branching decisions,
+    which keeps the comparison focused on the branching heuristic.
     """
 
     def __init__(self, instance: SATInstance):
@@ -192,20 +196,67 @@ class CDCLSolver:
         value = 1 if self.literal_bias[var] >= 0 else -1
         return var, value
 
-    def solve(self, preferred_literals: Optional[list[int]] = None) -> tuple[bool, float]:
+    def solve(
+        self,
+        preferred_literals: Optional[list[int]] = None,
+        decision_policy: Optional[DecisionPolicy] = None,
+    ) -> tuple[bool, float]:
         start = time.perf_counter()
-        result = self._search(preferred_literals or [], 0)
+        result = self._search(preferred_literals or [], 0, decision_policy)
         return result, time.perf_counter() - start
 
-    def _search(self, preferred_literals: list[int], pref_idx: int) -> bool:
+    def _solve_with_learning(
+        self,
+        preferred_literals: list[int],
+        decision_policy: Optional[DecisionPolicy] = None,
+    ) -> bool:
+        pref_idx = 0
+
+        while True:
+            conflict = self.unit_propagate()
+            if conflict is not None:
+                if self.current_level == 0:
+                    return False
+
+                learned, backtrack_level = self.analyze_conflict(conflict)
+                self.backtrack(backtrack_level)
+                if learned and learned not in self.clauses:
+                    self.clauses.append(learned)
+                    self.stats.learned_clauses += 1
+                continue
+
+            if all(self.assignment[v] != 0 for v in range(1, self.inst.n_vars + 1)):
+                return True
+
+            decision = self._next_decision(preferred_literals, pref_idx, decision_policy)
+            if decision is None:
+                return True
+
+            var, value, pref_idx = decision
+            self.current_level += 1
+            self.trail_lim.append(len(self.trail))
+            self._enqueue(var, value, self.current_level, reason=None)
+            self.stats.decisions += 1
+
+    def _search(
+        self,
+        preferred_literals: list[int],
+        pref_idx: int,
+        decision_policy: Optional[DecisionPolicy] = None,
+    ) -> bool:
         conflict = self.unit_propagate()
         if conflict is not None:
+            if self.current_level > 0:
+                learned, _ = self.analyze_conflict(conflict)
+                if learned and learned not in self.clauses:
+                    self.clauses.append(learned)
+                    self.stats.learned_clauses += 1
             return False
 
         if all(self.assignment[v] != 0 for v in range(1, self.inst.n_vars + 1)):
             return True
 
-        decision = self._next_decision(preferred_literals, pref_idx)
+        decision = self._next_decision(preferred_literals, pref_idx, decision_policy)
         if decision is None:
             return True
 
@@ -216,7 +267,7 @@ class CDCLSolver:
             self.trail_lim.append(len(self.trail))
             self._enqueue(var, value, self.current_level, reason=None)
             self.stats.decisions += 1
-            if self._search(preferred_literals, next_pref_idx):
+            if self._search(preferred_literals, next_pref_idx, decision_policy):
                 return True
             self._restore(snap)
         return False
@@ -225,6 +276,7 @@ class CDCLSolver:
         self,
         preferred_literals: list[int],
         pref_idx: int,
+        decision_policy: Optional[DecisionPolicy] = None,
     ) -> Optional[tuple[int, int, int]]:
         while pref_idx < len(preferred_literals):
             lit = preferred_literals[pref_idx]
@@ -232,6 +284,14 @@ class CDCLSolver:
             var = abs(lit)
             if 1 <= var <= self.inst.n_vars and self.assignment[var] == 0:
                 return var, 1 if lit > 0 else -1, pref_idx
+
+        if decision_policy is not None:
+            self.stats.policy_calls += 1
+            decision = decision_policy(self)
+            if decision is not None:
+                var, value = decision
+                if 1 <= var <= self.inst.n_vars and self.assignment[var] == 0:
+                    return var, 1 if value >= 0 else -1, pref_idx
 
         picked = self.pick_branching_variable()
         if picked is None:
@@ -247,10 +307,17 @@ class CDCLSolver:
         }
 
 
-def solve_file(filepath: str, preferred_literals: Optional[list[int]] = None) -> tuple[bool, float]:
+def solve_file(
+    filepath: str,
+    preferred_literals: Optional[list[int]] = None,
+    decision_policy: Optional[DecisionPolicy] = None,
+) -> tuple[bool, float]:
     inst = SATInstance.from_dimacs(filepath)
     solver = CDCLSolver(inst)
-    return solver.solve(preferred_literals=preferred_literals)
+    return solver.solve(
+        preferred_literals=preferred_literals,
+        decision_policy=decision_policy,
+    )
 
 
 if __name__ == "__main__":

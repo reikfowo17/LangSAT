@@ -1,18 +1,16 @@
 import os
 import sys
 import json
-import time
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from stable_baselines3 import PPO
-from cdcl_baseline import SATInstance, solve_file
-from smartsat_env import SmartSATEnv, N_VARS, N_CLAUSES
+from cdcl_baseline import CDCLSolver, SATInstance
+from smartsat_env import N_VARS, build_solver_observation, extract_sat_features
 
 
 # Đường dẫn: tự động phát hiện local vs Kaggle
@@ -29,7 +27,6 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 PAPER_MEDIAN_SECONDS = 1.02
 TIME_SCALE = float(os.environ.get("LANGSAT_TIME_SCALE", "1.0"))
 REPORT_SCALE_TO_PAPER = os.environ.get("LANGSAT_REPORT_SCALE_TO_PAPER", "0") == "1"
-MAX_POLICY_HINTS = int(os.environ.get("LANGSAT_MAX_POLICY_HINTS", "8"))
 
 
 def _time_scale(df: pd.DataFrame) -> float:
@@ -44,41 +41,41 @@ def _time_scale(df: pd.DataFrame) -> float:
     return PAPER_MEDIAN_SECONDS / float(np.mean(positive))
 
 
-def solve_with_smartsat(filepath: str, model: PPO) -> tuple[bool, float]:
-    env = SmartSATEnv([filepath])
-    obs, _ = env.reset()
-
-    start = time.perf_counter()
-    done = False
-    info = {}
-    while not done:
-        action, _ = model.predict(obs, deterministic=True)
-        obs, reward, terminated, truncated, info = env.step(int(action))
-        done = terminated or truncated
-        if len(env.preferred_literals) >= MAX_POLICY_HINTS:
-            break
-
-    policy_time = time.perf_counter() - start
-    preferred_literals = list(info.get("preferred_literals", env.preferred_literals))
-    preferred_literals = preferred_literals[:MAX_POLICY_HINTS]
-    preferred_literals.extend(_structural_branching_hints(filepath, preferred_literals))
-
-    sat, solver_time = solve_file(filepath, preferred_literals=preferred_literals)
-    return sat, policy_time + solver_time
-
-
-def _structural_branching_hints(filepath: str, existing: list[int]) -> list[int]:
+def solve_with_smartsat(filepath: str, model: PPO) -> tuple[bool, float, dict]:
     inst = SATInstance.from_dimacs(filepath)
-    seen = {abs(lit) for lit in existing}
-    score = [0] * (inst.n_vars + 1)
-    for clause in inst.clauses:
-        for lit in clause:
-            score[abs(lit)] += 1 if lit > 0 else -1
-    order = sorted(
-        (v for v in range(1, inst.n_vars + 1) if v not in seen),
-        key=lambda v: -abs(score[v]),
-    )
-    return [v if score[v] >= 0 else -v for v in order]
+    solver = CDCLSolver(inst)
+    global_features = extract_sat_features(filepath)
+
+    def policy(current_solver: CDCLSolver):
+        obs = build_solver_observation(current_solver, global_features)
+        action, _ = model.predict(obs, deterministic=True)
+        action = int(action)
+        var = action // 2 + 1
+        value = 1 if action % 2 == 1 else -1
+        if 1 <= var <= current_solver.inst.n_vars and current_solver.assignment[var] == 0:
+            return var, value
+        return current_solver.pick_branching_variable()
+
+    sat, elapsed = solver.solve(decision_policy=policy)
+    return sat, elapsed, {
+        "decisions": solver.stats.decisions,
+        "propagations": solver.stats.propagations,
+        "conflicts": solver.stats.conflicts,
+        "policy_calls": solver.stats.policy_calls,
+    }
+
+
+def solve_baseline_with_stats(filepath: str) -> tuple[bool, float, dict]:
+    inst = SATInstance.from_dimacs(filepath)
+    solver = CDCLSolver(inst)
+    sat, elapsed = solver.solve()
+    return sat, elapsed, {
+        "decisions": solver.stats.decisions,
+        "propagations": solver.stats.propagations,
+        "conflicts": solver.stats.conflicts,
+        "policy_calls": solver.stats.policy_calls,
+    }
+
 
 def evaluate(test_files: list[str], model: PPO) -> pd.DataFrame:
     results = []
@@ -88,18 +85,25 @@ def evaluate(test_files: list[str], model: PPO) -> pd.DataFrame:
 
     for i, filepath in enumerate(test_files):
         # 1. CDCL Baseline
-        baseline_sat, baseline_time = solve_file(filepath)
+        baseline_sat, baseline_time, baseline_stats = solve_baseline_with_stats(filepath)
 
         # 2. SmartSAT
-        smartsat_sat, smartsat_time = solve_with_smartsat(filepath, model)
+        smartsat_sat, smartsat_time, smartsat_stats = solve_with_smartsat(filepath, model)
 
         results.append({
             "file": os.path.basename(filepath),
             "instance_idx": i,
             "baseline_sat": baseline_sat,
             "baseline_time_raw": baseline_time,
+            "baseline_decisions": baseline_stats["decisions"],
+            "baseline_propagations": baseline_stats["propagations"],
+            "baseline_conflicts": baseline_stats["conflicts"],
             "smartsat_sat": smartsat_sat,
             "smartsat_time_raw": smartsat_time,
+            "smartsat_decisions": smartsat_stats["decisions"],
+            "smartsat_propagations": smartsat_stats["propagations"],
+            "smartsat_conflicts": smartsat_stats["conflicts"],
+            "smartsat_policy_calls": smartsat_stats["policy_calls"],
         })
 
         if (i + 1) % 20 == 0 or i == 0:
@@ -139,6 +143,10 @@ def compute_metrics(df: pd.DataFrame) -> dict:
         "time_scale"       : round(float(df["time_scale"].iloc[0]), 6) if "time_scale" in df else 1.0,
         "sat_rate_smartsat": round(df["smartsat_sat"].mean() * 100, 2),
         "sat_rate_baseline": round(df["baseline_sat"].mean() * 100, 2),
+        "median_decisions_smartsat": round(float(df["smartsat_decisions"].median()), 2),
+        "median_decisions_baseline": round(float(df["baseline_decisions"].median()), 2),
+        "median_conflicts_smartsat": round(float(df["smartsat_conflicts"].median()), 2),
+        "median_conflicts_baseline": round(float(df["baseline_conflicts"].median()), 2),
     }
 
     # In bảng kết quả
@@ -149,6 +157,8 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     print(f"  Hòa                  : {metrics['ties']}")
     print(f"  Median SmartSAT      : {metrics['median_smartsat']}s")
     print(f"  Median Baseline      : {metrics['median_baseline']}s")
+    print(f"  Median decisions ST  : {metrics['median_decisions_smartsat']}")
+    print(f"  Median decisions BSL : {metrics['median_decisions_baseline']}")
     print(f"  [Bài báo gốc]        : ~53% win rate, ~1.02s median")
     print("="*55)
 

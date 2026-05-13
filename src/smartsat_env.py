@@ -69,6 +69,44 @@ OBS_SIZE = N_VARS + N_CLAUSES + N_VARS * N_CLAUSES + N_GLOBAL
 # 20 + 91 + 1820 + 48 = 1979
 
 
+def build_solver_observation(
+    solver: CDCLSolver,
+    global_features: np.ndarray,
+) -> np.ndarray:
+    n = N_VARS
+
+    var_assign = np.array(
+        [
+            solver.assignment[v] if v <= solver.inst.n_vars else 0
+            for v in range(1, n + 1)
+        ],
+        dtype=np.float32,
+    )
+
+    clause_eval = np.zeros(N_CLAUSES, dtype=np.float32)
+    for ci, clause in enumerate(solver.clauses[:N_CLAUSES]):
+        vals = [solver._lit_value(lit) for lit in clause]
+        if 1 in vals:
+            clause_eval[ci] = 1.0
+        elif all(v == -1 for v in vals):
+            clause_eval[ci] = -1.0
+
+    graph = np.zeros((N_CLAUSES, n), dtype=np.float32)
+    for ci, clause in enumerate(solver.clauses[:N_CLAUSES]):
+        for lit in clause:
+            vi = abs(lit) - 1
+            if 0 <= vi < n:
+                graph[ci, vi] = 1.0 if lit > 0 else -1.0
+
+    if len(global_features) >= N_GLOBAL:
+        features = global_features[:N_GLOBAL]
+    else:
+        features = np.pad(global_features, (0, N_GLOBAL - len(global_features)))
+
+    obs = np.concatenate([var_assign, clause_eval, graph.flatten(), features])
+    return obs.astype(np.float32)
+
+
 class SmartSATEnv(gym.Env):
     metadata = {"render_modes": []}
 
@@ -106,43 +144,7 @@ class SmartSATEnv(gym.Env):
         self._global_features = extract_sat_features(filepath, N_GLOBAL)
 
     def _get_obs(self) -> np.ndarray:
-        solver = self._solver
-        n = N_VARS
-
-        # Variable assignments
-        var_assign = np.array(
-            [solver.assignment[v] for v in range(1, n + 1)],
-            dtype=np.float32
-        )  # shape (20,)
-
-        # Clause evaluations
-        clause_eval = np.zeros(N_CLAUSES, dtype=np.float32)
-        for ci, clause in enumerate(solver.clauses[:N_CLAUSES]):
-            vals = [solver._lit_value(lit) for lit in clause]
-            if 1 in vals:
-                clause_eval[ci] = 1.0
-            elif all(v == -1 for v in vals):
-                clause_eval[ci] = -1.0
-            else:
-                clause_eval[ci] = 0.0
-
-        # Bipartite graph (clause × var)
-        # Bipartite graph — GIỮ POLARITY theo bài báo Section 3.2.2:
-        # "Positive and negative literals are treated distinctly to preserve clause polarity"
-        graph = np.zeros((N_CLAUSES, n), dtype=np.float32)
-        for ci, clause in enumerate(solver.clauses[:N_CLAUSES]):
-            for lit in clause:
-                vi = abs(lit) - 1
-                if 0 <= vi < n:
-                    graph[ci, vi] = 1.0 if lit > 0 else -1.0
-
-        obs = np.concatenate([
-            var_assign,
-            clause_eval,
-            graph.flatten(),
-            self._global_features
-        ])
-        return obs.astype(np.float32)
+        return build_solver_observation(self._solver, self._global_features)
 
     def _compute_reward(self) -> float:
         reward = 0.0
