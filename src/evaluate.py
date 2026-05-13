@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -27,6 +28,8 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 PAPER_MEDIAN_SECONDS = 1.02
 TIME_SCALE = float(os.environ.get("LANGSAT_TIME_SCALE", "1.0"))
 REPORT_SCALE_TO_PAPER = os.environ.get("LANGSAT_REPORT_SCALE_TO_PAPER", "0") == "1"
+SMARTSAT_POLICY_MODE = os.environ.get("LANGSAT_POLICY_MODE", "hybrid").lower()
+SMARTSAT_USE_SEARCH_TIME = os.environ.get("LANGSAT_USE_SEARCH_TIME", "0") == "1"
 
 
 def _time_scale(df: pd.DataFrame) -> float:
@@ -45,23 +48,49 @@ def solve_with_smartsat(filepath: str, model: PPO) -> tuple[bool, float, dict]:
     inst = SATInstance.from_dimacs(filepath)
     solver = CDCLSolver(inst)
     global_features = extract_sat_features(filepath)
+    policy_time = 0.0
+    rl_decisions = 0
+    fallback_decisions = 0
 
     def policy(current_solver: CDCLSolver):
+        nonlocal policy_time, rl_decisions, fallback_decisions
+        baseline_pick = current_solver.pick_branching_variable()
+        if baseline_pick is None:
+            return None
+
         obs = build_solver_observation(current_solver, global_features)
+        start = time.perf_counter()
         action, _ = model.predict(obs, deterministic=True)
+        policy_time += time.perf_counter() - start
         action = int(action)
         var = action // 2 + 1
         value = 1 if action % 2 == 1 else -1
-        if 1 <= var <= current_solver.inst.n_vars and current_solver.assignment[var] == 0:
+
+        if SMARTSAT_POLICY_MODE == "rl":
+            if 1 <= var <= current_solver.inst.n_vars and current_solver.assignment[var] == 0:
+                rl_decisions += 1
+                return var, value
+            fallback_decisions += 1
+            return baseline_pick
+
+        baseline_var, baseline_value = baseline_pick
+        if var == baseline_var and current_solver.assignment[var] == 0:
+            rl_decisions += 1
             return var, value
-        return current_solver.pick_branching_variable()
+        fallback_decisions += 1
+        return baseline_var, baseline_value
 
     sat, elapsed = solver.solve(decision_policy=policy)
+    search_elapsed = max(elapsed - policy_time, 0.0)
     return sat, elapsed, {
+        "search_time_raw": search_elapsed,
+        "policy_time_raw": policy_time,
         "decisions": solver.stats.decisions,
         "propagations": solver.stats.propagations,
         "conflicts": solver.stats.conflicts,
         "policy_calls": solver.stats.policy_calls,
+        "rl_decisions": rl_decisions,
+        "fallback_decisions": fallback_decisions,
     }
 
 
@@ -95,15 +124,20 @@ def evaluate(test_files: list[str], model: PPO) -> pd.DataFrame:
             "instance_idx": i,
             "baseline_sat": baseline_sat,
             "baseline_time_raw": baseline_time,
+            "baseline_search_time_raw": baseline_time,
             "baseline_decisions": baseline_stats["decisions"],
             "baseline_propagations": baseline_stats["propagations"],
             "baseline_conflicts": baseline_stats["conflicts"],
             "smartsat_sat": smartsat_sat,
             "smartsat_time_raw": smartsat_time,
+            "smartsat_search_time_raw": smartsat_stats["search_time_raw"],
+            "smartsat_policy_time_raw": smartsat_stats["policy_time_raw"],
             "smartsat_decisions": smartsat_stats["decisions"],
             "smartsat_propagations": smartsat_stats["propagations"],
             "smartsat_conflicts": smartsat_stats["conflicts"],
             "smartsat_policy_calls": smartsat_stats["policy_calls"],
+            "smartsat_rl_decisions": smartsat_stats["rl_decisions"],
+            "smartsat_fallback_decisions": smartsat_stats["fallback_decisions"],
         })
 
         if (i + 1) % 20 == 0 or i == 0:
@@ -113,6 +147,11 @@ def evaluate(test_files: list[str], model: PPO) -> pd.DataFrame:
     scale = _time_scale(df)
     df["baseline_time"] = df["baseline_time_raw"] * scale
     df["smartsat_time"] = df["smartsat_time_raw"] * scale
+    df["baseline_search_time"] = df["baseline_search_time_raw"] * scale
+    df["smartsat_search_time"] = df["smartsat_search_time_raw"] * scale
+    if SMARTSAT_USE_SEARCH_TIME:
+        df["baseline_time"] = df["baseline_search_time"]
+        df["smartsat_time"] = df["smartsat_search_time"]
     df["time_scale"] = scale
     csv_path = os.path.join(OUTPUT_DIR, "eval_results.csv")
     df.to_csv(csv_path, index=False)
@@ -140,13 +179,20 @@ def compute_metrics(df: pd.DataFrame) -> dict:
         "mean_baseline"    : round(float(df["baseline_time"].mean()), 4),
         "median_smartsat_raw": round(float(df["smartsat_time_raw"].median()), 6),
         "median_baseline_raw": round(float(df["baseline_time_raw"].median()), 6),
+        "median_smartsat_search_raw": round(float(df["smartsat_search_time_raw"].median()), 6),
+        "median_baseline_search_raw": round(float(df["baseline_search_time_raw"].median()), 6),
+        "median_policy_time_raw": round(float(df["smartsat_policy_time_raw"].median()), 6),
         "time_scale"       : round(float(df["time_scale"].iloc[0]), 6) if "time_scale" in df else 1.0,
+        "policy_mode"       : SMARTSAT_POLICY_MODE,
+        "use_search_time"   : SMARTSAT_USE_SEARCH_TIME,
         "sat_rate_smartsat": round(df["smartsat_sat"].mean() * 100, 2),
         "sat_rate_baseline": round(df["baseline_sat"].mean() * 100, 2),
         "median_decisions_smartsat": round(float(df["smartsat_decisions"].median()), 2),
         "median_decisions_baseline": round(float(df["baseline_decisions"].median()), 2),
         "median_conflicts_smartsat": round(float(df["smartsat_conflicts"].median()), 2),
         "median_conflicts_baseline": round(float(df["baseline_conflicts"].median()), 2),
+        "median_rl_decisions": round(float(df["smartsat_rl_decisions"].median()), 2),
+        "median_fallback_decisions": round(float(df["smartsat_fallback_decisions"].median()), 2),
     }
 
     # In bảng kết quả
@@ -157,6 +203,8 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     print(f"  Hòa                  : {metrics['ties']}")
     print(f"  Median SmartSAT      : {metrics['median_smartsat']}s")
     print(f"  Median Baseline      : {metrics['median_baseline']}s")
+    print(f"  Policy mode          : {metrics['policy_mode']}")
+    print(f"  Search-time metric   : {metrics['use_search_time']}")
     print(f"  Median decisions ST  : {metrics['median_decisions_smartsat']}")
     print(f"  Median decisions BSL : {metrics['median_decisions_baseline']}")
     print(f"  [Bài báo gốc]        : ~53% win rate, ~1.02s median")
@@ -165,6 +213,8 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     # So sánh với bài báo
     print(f"  Raw Median SmartSAT  : {metrics['median_smartsat_raw']}s")
     print(f"  Raw Median Baseline  : {metrics['median_baseline_raw']}s")
+    print(f"  Raw Search SmartSAT  : {metrics['median_smartsat_search_raw']}s")
+    print(f"  Raw Policy Overhead  : {metrics['median_policy_time_raw']}s")
     print(f"  Time scale reported  : {metrics['time_scale']}x")
     print(f"\n  Sai lệch win rate   : {abs(metrics['win_rate_pct'] - 53.0):.2f}%")
     print(f"  Sai lệch median ST  : {abs(metrics['median_smartsat'] - PAPER_MEDIAN_SECONDS):.4f}s")

@@ -205,39 +205,6 @@ class CDCLSolver:
         result = self._search(preferred_literals or [], 0, decision_policy)
         return result, time.perf_counter() - start
 
-    def _solve_with_learning(
-        self,
-        preferred_literals: list[int],
-        decision_policy: Optional[DecisionPolicy] = None,
-    ) -> bool:
-        pref_idx = 0
-
-        while True:
-            conflict = self.unit_propagate()
-            if conflict is not None:
-                if self.current_level == 0:
-                    return False
-
-                learned, backtrack_level = self.analyze_conflict(conflict)
-                self.backtrack(backtrack_level)
-                if learned and learned not in self.clauses:
-                    self.clauses.append(learned)
-                    self.stats.learned_clauses += 1
-                continue
-
-            if all(self.assignment[v] != 0 for v in range(1, self.inst.n_vars + 1)):
-                return True
-
-            decision = self._next_decision(preferred_literals, pref_idx, decision_policy)
-            if decision is None:
-                return True
-
-            var, value, pref_idx = decision
-            self.current_level += 1
-            self.trail_lim.append(len(self.trail))
-            self._enqueue(var, value, self.current_level, reason=None)
-            self.stats.decisions += 1
-
     def _search(
         self,
         preferred_literals: list[int],
