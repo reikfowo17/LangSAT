@@ -109,6 +109,11 @@ A="A", B="B"
         self._api_cost_tokens = 0   # tracking token usage
 
     def _get_client(self):
+        if not self._api_key:
+            raise ValueError(
+                "OPENAI_API_KEY is required for English text -> logic translation. "
+                "Use parse_expression() for already-formatted logic expressions."
+            )
         if self._client is None:
             try:
                 from openai import OpenAI

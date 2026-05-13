@@ -48,7 +48,7 @@ langsat_reproduce/
 
 ## Lang2Logic → DIMACS → SAT
 
-`lang2logic.py` chuyển English/propositional text thành CNF. Với biểu thức logic đã ở format bài báo, có thể xuất DIMACS và giải bằng solver trong repo:
+`lang2logic.py` chuyển English/propositional text thành CNF. Bước English → logic dùng OpenAI API. Nếu input đã ở format logic của bài báo (`And(...)`, `Or(...)`, `Not(...)`, `Implies(...)`, `Equivalent(...)`) thì không cần API:
 
 ```python
 from lang2logic import Lang2Logic
@@ -60,7 +60,7 @@ pipeline.save_dimacs(expr, "results/example.cnf")
 sat, seconds = solve_file("results/example.cnf")
 ```
 
-Chạy từ English text cần `OPENAI_API_KEY`, vì bước NL → logic dùng OpenAI API:
+Chạy từ English text cần `OPENAI_API_KEY`:
 
 ```python
 from lang2logic import Lang2Logic
@@ -72,3 +72,9 @@ with open("results/from_text.cnf", "w", encoding="utf-8") as f:
 ```
 
 Phần benchmark SmartSAT trên `uf20-91` vẫn là thực nghiệm riêng để so sánh heuristic với baseline.
+
+## Ghi chú reproduce
+
+- SmartSAT dùng 48 global SAT features. Repo ưu tiên `satfeatpy`; nếu import thất bại thì `smartsat_env.py` dùng fallback feature tự tính để pipeline vẫn chạy.
+- Kết quả thời gian nên đọc từ raw metrics trước. `LANGSAT_REPORT_SCALE_TO_PAPER` chỉ dùng để tạo bảng hardware-normalized phụ, không thay thế raw runtime.
+- `src/end_to_end.py` không còn là entrypoint; end-to-end được tích hợp vào `lang2logic.py` để bám cấu trúc module của repo.
