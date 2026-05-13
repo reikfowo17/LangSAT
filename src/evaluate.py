@@ -89,6 +89,10 @@ def solve_with_smartsat(filepath: str, model: PPO) -> tuple[bool, float, dict]:
         "propagations": solver.stats.propagations,
         "conflicts": solver.stats.conflicts,
         "policy_calls": solver.stats.policy_calls,
+        "learned_clauses": solver.stats.learned_clauses,
+        "engine": solver.stats.engine,
+        "budget_exceeded": solver.stats.budget_exceeded,
+        "timed_out": solver.stats.timed_out,
         "rl_decisions": rl_decisions,
         "fallback_decisions": fallback_decisions,
     }
@@ -103,6 +107,10 @@ def solve_baseline_with_stats(filepath: str) -> tuple[bool, float, dict]:
         "propagations": solver.stats.propagations,
         "conflicts": solver.stats.conflicts,
         "policy_calls": solver.stats.policy_calls,
+        "learned_clauses": solver.stats.learned_clauses,
+        "engine": solver.stats.engine,
+        "budget_exceeded": solver.stats.budget_exceeded,
+        "timed_out": solver.stats.timed_out,
     }
 
 
@@ -128,6 +136,10 @@ def evaluate(test_files: list[str], model: PPO) -> pd.DataFrame:
             "baseline_decisions": baseline_stats["decisions"],
             "baseline_propagations": baseline_stats["propagations"],
             "baseline_conflicts": baseline_stats["conflicts"],
+            "baseline_learned_clauses": baseline_stats["learned_clauses"],
+            "baseline_engine": baseline_stats["engine"],
+            "baseline_budget_exceeded": baseline_stats["budget_exceeded"],
+            "baseline_timed_out": baseline_stats["timed_out"],
             "smartsat_sat": smartsat_sat,
             "smartsat_time_raw": smartsat_time,
             "smartsat_search_time_raw": smartsat_stats["search_time_raw"],
@@ -136,6 +148,10 @@ def evaluate(test_files: list[str], model: PPO) -> pd.DataFrame:
             "smartsat_propagations": smartsat_stats["propagations"],
             "smartsat_conflicts": smartsat_stats["conflicts"],
             "smartsat_policy_calls": smartsat_stats["policy_calls"],
+            "smartsat_learned_clauses": smartsat_stats["learned_clauses"],
+            "smartsat_engine": smartsat_stats["engine"],
+            "smartsat_budget_exceeded": smartsat_stats["budget_exceeded"],
+            "smartsat_timed_out": smartsat_stats["timed_out"],
             "smartsat_rl_decisions": smartsat_stats["rl_decisions"],
             "smartsat_fallback_decisions": smartsat_stats["fallback_decisions"],
         })
@@ -193,6 +209,10 @@ def compute_metrics(df: pd.DataFrame) -> dict:
         "median_conflicts_baseline": round(float(df["baseline_conflicts"].median()), 2),
         "median_rl_decisions": round(float(df["smartsat_rl_decisions"].median()), 2),
         "median_fallback_decisions": round(float(df["smartsat_fallback_decisions"].median()), 2),
+        "baseline_budget_exits": int(df["baseline_budget_exceeded"].sum()),
+        "smartsat_budget_exits": int(df["smartsat_budget_exceeded"].sum()),
+        "baseline_pysat_fallbacks": int((df["baseline_engine"] == "pysat_minisat22").sum()),
+        "smartsat_pysat_fallbacks": int((df["smartsat_engine"] == "pysat_minisat22").sum()),
     }
 
     # In bảng kết quả
@@ -205,6 +225,9 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     print(f"  Median Baseline      : {metrics['median_baseline']}s")
     print(f"  Policy mode          : {metrics['policy_mode']}")
     print(f"  Search-time metric   : {metrics['use_search_time']}")
+    print(f"  Baseline budget exits: {metrics['baseline_budget_exits']}")
+    print(f"  SmartSAT budget exits: {metrics['smartsat_budget_exits']}")
+    print(f"  PySAT fallbacks B/ST : {metrics['baseline_pysat_fallbacks']}/{metrics['smartsat_pysat_fallbacks']}")
     print(f"  Median decisions ST  : {metrics['median_decisions_smartsat']}")
     print(f"  Median decisions BSL : {metrics['median_decisions_baseline']}")
     print(f"  [Bài báo gốc]        : ~53% win rate, ~1.02s median")

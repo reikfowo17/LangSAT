@@ -1,6 +1,13 @@
+import os
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional
+
+
+DEFAULT_MAX_CONFLICTS = int(os.environ.get("LANGSAT_SOLVER_MAX_CONFLICTS", "250"))
+DEFAULT_MAX_SECONDS = float(os.environ.get("LANGSAT_SOLVER_MAX_SECONDS", "5.0"))
+DEFAULT_MAX_DECISIONS = int(os.environ.get("LANGSAT_SOLVER_MAX_DECISIONS", "20000"))
+USE_PYSAT_FALLBACK = os.environ.get("LANGSAT_USE_PYSAT", "1") == "1"
 
 
 class SATInstance:
@@ -60,6 +67,9 @@ class SolveStats:
     conflicts: int = 0
     policy_calls: int = 0
     learned_clauses: int = 0
+    timed_out: bool = False
+    budget_exceeded: bool = False
+    engine: str = "python_cdcl"
 
 
 DecisionPolicy = Callable[["CDCLSolver"], Optional[tuple[int, int]]]
@@ -200,25 +210,52 @@ class CDCLSolver:
         self,
         preferred_literals: Optional[list[int]] = None,
         decision_policy: Optional[DecisionPolicy] = None,
+        max_conflicts: int = DEFAULT_MAX_CONFLICTS,
+        max_seconds: float = DEFAULT_MAX_SECONDS,
+        max_decisions: int = DEFAULT_MAX_DECISIONS,
     ) -> tuple[bool, float]:
         start = time.perf_counter()
         preferred_literals = preferred_literals or []
-        result = self._cdcl_search(preferred_literals, decision_policy)
+        deadline = start + max_seconds if max_seconds and max_seconds > 0 else None
+        result = self._cdcl_search(
+            preferred_literals,
+            decision_policy,
+            max_conflicts=max_conflicts,
+            max_decisions=max_decisions,
+            deadline=deadline,
+        )
         if result is None:
-            self._clear_state(keep_heuristics=True)
-            result = self._search(preferred_literals, 0, decision_policy)
+            self.stats.budget_exceeded = True
+            if deadline is not None and time.perf_counter() >= deadline:
+                self.stats.timed_out = True
+            pysat_result = self._solve_with_pysat()
+            if pysat_result is not None:
+                result = pysat_result
+                self.stats.engine = "pysat_minisat22"
+            else:
+                raise RuntimeError(
+                    "Python CDCL solver exceeded its safety budget and PySAT "
+                    "fallback is unavailable. Install `python-sat`, set "
+                    "`LANGSAT_USE_PYSAT=1`, or increase "
+                    "`LANGSAT_SOLVER_MAX_SECONDS`."
+                )
         return result, time.perf_counter() - start
 
     def _cdcl_search(
         self,
         preferred_literals: list[int],
         decision_policy: Optional[DecisionPolicy] = None,
-        max_conflicts: int = 250,
+        max_conflicts: int = DEFAULT_MAX_CONFLICTS,
+        max_decisions: int = DEFAULT_MAX_DECISIONS,
+        deadline: Optional[float] = None,
     ) -> Optional[bool]:
         pref_idx = 0
         seen_learned: set[tuple[int, ...]] = set()
 
         while True:
+            if self._budget_hit(max_decisions, deadline):
+                return None
+
             conflict = self.unit_propagate()
             if conflict is not None:
                 if self.current_level == 0:
@@ -251,6 +288,30 @@ class CDCLSolver:
             self.trail_lim.append(len(self.trail))
             self._enqueue(var, value, self.current_level, reason=None)
             self.stats.decisions += 1
+            if self._budget_hit(max_decisions, deadline):
+                return None
+
+    def _budget_hit(self, max_decisions: int, deadline: Optional[float]) -> bool:
+        if max_decisions and self.stats.decisions >= max_decisions:
+            return True
+        if deadline is not None and time.perf_counter() >= deadline:
+            self.stats.timed_out = True
+            return True
+        return False
+
+    def _solve_with_pysat(self) -> Optional[bool]:
+        if not USE_PYSAT_FALLBACK:
+            return None
+        try:
+            from pysat.solvers import Minisat22
+        except Exception:
+            return None
+
+        try:
+            with Minisat22(bootstrap_with=self.inst.clauses) as solver:
+                return bool(solver.solve())
+        except Exception:
+            return None
 
     def _learn_asserting_clause(self, conflict_ci: int) -> tuple[list[int], int]:
         conflict_clause = self.clauses[conflict_ci]
@@ -363,12 +424,18 @@ def solve_file(
     filepath: str,
     preferred_literals: Optional[list[int]] = None,
     decision_policy: Optional[DecisionPolicy] = None,
+    max_conflicts: int = DEFAULT_MAX_CONFLICTS,
+    max_seconds: float = DEFAULT_MAX_SECONDS,
+    max_decisions: int = DEFAULT_MAX_DECISIONS,
 ) -> tuple[bool, float]:
     inst = SATInstance.from_dimacs(filepath)
     solver = CDCLSolver(inst)
     return solver.solve(
         preferred_literals=preferred_literals,
         decision_policy=decision_policy,
+        max_conflicts=max_conflicts,
+        max_seconds=max_seconds,
+        max_decisions=max_decisions,
     )
 
 

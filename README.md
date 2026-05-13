@@ -76,6 +76,6 @@ Phần benchmark SmartSAT trên `uf20-91` vẫn là thực nghiệm riêng để
 ## Ghi chú reproduce
 
 - SmartSAT dùng 48 global SAT features. `satfeatpy` là optional và không được pin trong `requirements.txt` vì Kaggle/PyPI hiện không có wheel phù hợp; nếu người dùng cài được SATfeatPy thủ công thì repo sẽ ưu tiên dùng, còn mặc định `smartsat_env.py` dùng fallback feature tự tính để pipeline vẫn chạy.
-- Baseline dùng CDCL-style search với VSIDS, conflict learning và backtracking; nếu một instance vượt ngưỡng conflict an toàn, solver fallback sang DPLL complete để tránh treo notebook.
+- Baseline dùng CDCL-style search với VSIDS, conflict learning và backtracking. Để tránh Kaggle treo ở một instance khó, solver có budget qua `LANGSAT_SOLVER_MAX_SECONDS`, `LANGSAT_SOLVER_MAX_CONFLICTS`, `LANGSAT_SOLVER_MAX_DECISIONS`; khi vượt budget repo fallback sang PySAT `Minisat22` nếu `python-sat` cài được.
 - Kết quả thời gian nên đọc từ raw metrics trước. `LANGSAT_REPORT_SCALE_TO_PAPER` chỉ dùng để tạo bảng hardware-normalized phụ, không thay thế raw runtime.
 - `src/end_to_end.py` không còn là entrypoint; end-to-end được tích hợp vào `lang2logic.py` để bám cấu trúc module của repo.

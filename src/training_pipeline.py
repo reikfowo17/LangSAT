@@ -145,11 +145,14 @@ def train_smartsat(train_files: list[str]) -> tuple:
     print(f"[Train] Bắt đầu training...")
     start_time = time.time()
 
-    model.learn(
-        total_timesteps=TOTAL_STEPS,
-        callback=reward_callback,
-        progress_bar=True,
-    )
+    try:
+        model.learn(
+            total_timesteps=TOTAL_STEPS,
+            callback=reward_callback,
+            progress_bar=True,
+        )
+    finally:
+        vec_env.close()
 
     elapsed = time.time() - start_time
     print(f"\n[Train] Hoàn thành sau {elapsed/60:.1f} phút")
