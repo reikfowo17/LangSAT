@@ -1,0 +1,291 @@
+import hashlib
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Iterable
+
+import numpy as np
+
+from cdcl_baseline import SATInstance
+
+
+N_SATZILLA_FEATURES = 48
+SATFEATPY_DIR = os.environ.get("LANGSAT_SATFEATPY_DIR", "").strip()
+FEATURE_BACKEND = os.environ.get("LANGSAT_FEATURE_BACKEND", "auto").lower()
+FEATURE_CACHE_DIR = os.environ.get("LANGSAT_FEATURE_CACHE_DIR", "").strip()
+SATFEATPY_FULL_LOCAL_SEARCH = os.environ.get("LANGSAT_SATFEATPY_FULL_LOCAL_SEARCH", "0") == "1"
+_BACKEND_NOTICE_PRINTED: set[str] = set()
+BACKEND_USAGE = {"satfeatpy": 0, "fallback": 0, "cache": 0}
+
+
+SATZILLA_FEATURE_ORDER = [
+    "c",
+    "v",
+    "clauses_vars_ratio",
+    "vcg_var_mean",
+    "vcg_var_coeff",
+    "vcg_var_min",
+    "vcg_var_max",
+    "vcg_var_entropy",
+    "vcg_clause_mean",
+    "vcg_clause_coeff",
+    "vcg_clause_min",
+    "vcg_clause_max",
+    "vcg_clause_entropy",
+    "vg_mean",
+    "vg_coeff",
+    "vg_min",
+    "vg_max",
+    "pnc_ratio_mean",
+    "pnc_ratio_coeff",
+    "pnc_ratio_entropy",
+    "pnv_ratio_mean",
+    "pnv_ratio_coeff",
+    "pnv_ratio_min",
+    "pnv_ratio_max",
+    "pnv_ratio_entropy",
+    "binary_ratio",
+    "ternary+",
+    "ternary_ratio",
+    "hc_fraction",
+    "hc_var_mean",
+    "hc_var_coeff",
+    "hc_var_min",
+    "hc_var_max",
+    "hc_var_entropy",
+    "unit_props_at_depth_1",
+    "unit_props_at_depth_4",
+    "unit_props_at_depth_16",
+    "unit_props_at_depth_64",
+    "unit_props_at_depth_256",
+    "mean_depth_to_contradiction_over_vars",
+    "estimate_log_number_nodes_over_vars",
+    "saps_BestSolution_Mean",
+    "saps_FirstLocalMinStep_Median",
+    "saps_FirstLocalMinStep_Q.10",
+    "saps_FirstLocalMinStep_Q.90",
+    "saps_BestAvgImprovement_Mean",
+    "saps_FirstLocalMinRatio_Mean",
+    "saps_EstACL_Mean",
+]
+
+
+def extract_sat_features(filepath: str, n_features: int = N_SATZILLA_FEATURES) -> np.ndarray:
+    backend = FEATURE_BACKEND
+    if backend not in {"auto", "satfeatpy", "fallback"}:
+        _notice_once("backend", f"[Features] Unknown LANGSAT_FEATURE_BACKEND={backend!r}; using auto.")
+        backend = "auto"
+
+    cache_path = _cache_path(filepath, backend, n_features)
+    if cache_path and cache_path.exists():
+        try:
+            BACKEND_USAGE["cache"] += 1
+            return _normalize(np.array(json.loads(cache_path.read_text()), dtype=np.float32), n_features)
+        except Exception:
+            pass
+
+    arr: np.ndarray
+    if backend in {"auto", "satfeatpy"}:
+        try:
+            arr = _extract_with_satfeatpy(filepath, n_features)
+            BACKEND_USAGE["satfeatpy"] += 1
+            _notice_once("satfeatpy", "[Features] Using SATfeatPy/SATzilla-style global features.")
+        except Exception as exc:
+            if backend == "satfeatpy":
+                raise
+            _notice_once(
+                "fallback",
+                f"[Features] SATfeatPy unavailable or incomplete ({type(exc).__name__}: {exc}); using local fallback features.",
+            )
+            arr = _extract_fallback_features(filepath, n_features)
+            BACKEND_USAGE["fallback"] += 1
+    else:
+        _notice_once("fallback_forced", "[Features] Using local fallback features.")
+        arr = _extract_fallback_features(filepath, n_features)
+        BACKEND_USAGE["fallback"] += 1
+
+    arr = _normalize(arr, n_features)
+    if cache_path:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps(arr.astype(float).tolist()))
+        except Exception:
+            pass
+    return arr
+
+
+def _extract_with_satfeatpy(filepath: str, n_features: int) -> np.ndarray:
+    if not SATFEATPY_DIR:
+        raise RuntimeError("LANGSAT_SATFEATPY_DIR is not set")
+
+    satfeat_dir = Path(SATFEATPY_DIR)
+    if not satfeat_dir.exists():
+        raise FileNotFoundError(f"SATfeatPy directory not found: {satfeat_dir}")
+
+    satfeat_path = str(satfeat_dir)
+    if satfeat_path not in sys.path:
+        sys.path.insert(0, satfeat_path)
+
+    from sat_instance.sat_instance import SATInstance as SATFeatInstance
+
+    cnf_path = str(Path(filepath).resolve())
+    cwd = os.getcwd()
+    try:
+        os.chdir(satfeat_path)
+        sat = SATFeatInstance(cnf_path, preprocess=False)
+        if getattr(sat, "solved", False):
+            return np.zeros(n_features, dtype=np.float32)
+
+        sat.gen_basic_features()
+        sat.gen_dpll_probing_features()
+        if SATFEATPY_FULL_LOCAL_SEARCH:
+            sat.gen_local_search_probing_features()
+
+        features = sat.features_dict
+        values = [_safe_feature_value(features.get(name, 0.0)) for name in SATZILLA_FEATURE_ORDER]
+        return np.array(values, dtype=np.float32)
+    finally:
+        os.chdir(cwd)
+
+
+def _extract_fallback_features(filepath: str, n_features: int) -> np.ndarray:
+    inst = SATInstance.from_dimacs(filepath)
+    pos = np.zeros(inst.n_vars + 1, dtype=np.float32)
+    neg = np.zeros(inst.n_vars + 1, dtype=np.float32)
+    clause_lengths = []
+    horn_count = 0
+    binary_count = 0
+    ternary_count = 0
+    clause_balance = []
+
+    for clause in inst.clauses:
+        clause_lengths.append(len(clause))
+        n_pos = 0
+        n_neg = 0
+        for lit in clause:
+            if lit > 0:
+                pos[lit] += 1
+                n_pos += 1
+            else:
+                neg[-lit] += 1
+                n_neg += 1
+        if n_pos <= 1:
+            horn_count += 1
+        if len(clause) == 2:
+            binary_count += 1
+        if len(clause) == 3:
+            ternary_count += 1
+        denom = max(n_pos + n_neg, 1)
+        clause_balance.append(2.0 * abs(0.5 - (n_pos / denom)))
+
+    total_lits = float(sum(clause_lengths) or 1)
+    n_clauses = float(inst.n_clauses or 1)
+    occurrences = pos[1:] + neg[1:]
+    var_balance = np.zeros(max(inst.n_vars, 1), dtype=np.float32)
+    if inst.n_vars > 0:
+        denom = np.maximum(occurrences, 1.0)
+        var_balance = 2.0 * np.abs(0.5 - (pos[1:] / denom))
+
+    base_values = [
+        inst.n_clauses,
+        inst.n_vars,
+        inst.n_clauses / max(inst.n_vars, 1),
+        *_stats(occurrences / n_clauses),
+        _entropy(occurrences),
+        *_stats(np.array(clause_lengths, dtype=np.float32) / max(inst.n_vars, 1)),
+        _entropy(clause_lengths),
+        *_stats(occurrences / n_clauses),
+        *_stats(clause_balance)[:2],
+        _entropy_continuous(clause_balance),
+        *_stats(var_balance),
+        _entropy_continuous(var_balance),
+        binary_count / n_clauses,
+        (binary_count + ternary_count) / n_clauses,
+        ternary_count / n_clauses,
+        horn_count / n_clauses,
+        *_stats(occurrences / n_clauses),
+        _entropy(occurrences),
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    ]
+    return np.array(base_values[:n_features], dtype=np.float32)
+
+
+def _normalize(arr: np.ndarray, n_features: int) -> np.ndarray:
+    arr = np.nan_to_num(arr.astype(np.float32), nan=0.0, posinf=1e6, neginf=-1e6)
+    if len(arr) >= n_features:
+        arr = arr[:n_features]
+    else:
+        arr = np.pad(arr, (0, n_features - len(arr)))
+    arr = np.clip(arr, -1e6, 1e6)
+    scale = np.max(np.abs(arr))
+    if scale > 0:
+        arr = arr / (scale + 1e-8)
+    return arr.astype(np.float32)
+
+
+def _cache_path(filepath: str, backend: str, n_features: int) -> Path | None:
+    if not FEATURE_CACHE_DIR:
+        return None
+    resolved = str(Path(filepath).resolve())
+    key = hashlib.sha1(f"{resolved}|{backend}|{n_features}|{SATFEATPY_FULL_LOCAL_SEARCH}".encode()).hexdigest()
+    return Path(FEATURE_CACHE_DIR) / f"{key}.json"
+
+
+def _safe_feature_value(value) -> float:
+    try:
+        value = float(value)
+    except Exception:
+        return 0.0
+    if not np.isfinite(value):
+        return 0.0
+    return value
+
+
+def _stats(values: Iterable[float]) -> tuple[float, float, float, float]:
+    arr = np.array(list(values), dtype=np.float32)
+    if arr.size == 0:
+        return 0.0, 0.0, 0.0, 0.0
+    mean = float(np.mean(arr))
+    std = float(np.std(arr))
+    coeff = std / abs(mean) if abs(mean) > 1e-12 else 0.0
+    return mean, coeff, float(np.min(arr)), float(np.max(arr))
+
+
+def _entropy(values: Iterable[float]) -> float:
+    arr = np.array(list(values), dtype=np.float32)
+    if arr.size == 0:
+        return 0.0
+    _, counts = np.unique(arr, return_counts=True)
+    probs = counts.astype(np.float32) / float(np.sum(counts))
+    return float(-np.sum(probs * np.log2(probs + 1e-12)))
+
+
+def _entropy_continuous(values: Iterable[float], bins: int = 10) -> float:
+    arr = np.array(list(values), dtype=np.float32)
+    if arr.size == 0:
+        return 0.0
+    counts, _ = np.histogram(arr, bins=bins)
+    counts = counts[counts > 0]
+    if counts.size == 0:
+        return 0.0
+    probs = counts.astype(np.float32) / float(np.sum(counts))
+    return float(-np.sum(probs * np.log2(probs + 1e-12)))
+
+
+def _notice_once(key: str, message: str):
+    if key not in _BACKEND_NOTICE_PRINTED:
+        print(message)
+        _BACKEND_NOTICE_PRINTED.add(key)

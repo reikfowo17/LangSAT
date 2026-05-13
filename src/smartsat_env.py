@@ -8,62 +8,11 @@ from typing import Optional
 # Đảm bảo import được từ cùng thư mục src/
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cdcl_baseline import SATInstance, CDCLSolver
+from satfeat_adapter import extract_sat_features
 
 
 _BASELINE_DECISION_CACHE: dict[str, int] = {}
 
-
-def extract_sat_features(filepath: str, n_features: int = 48) -> np.ndarray:
-    try:
-        from satfeatpy import SATInstance as SFInst
-        sf = SFInst(filepath)
-        feats = sf.get_features()
-        arr = np.array(list(feats.values()), dtype=np.float32)
-        # Đảm bảo đúng 48 features
-        if len(arr) >= n_features:
-            arr = arr[:n_features]
-        else:
-            arr = np.pad(arr, (0, n_features - len(arr)))
-        # Normalize (clip + scale)
-        arr = np.clip(arr, -1e6, 1e6)
-        arr = arr / (np.abs(arr).max() + 1e-8)
-        return arr.astype(np.float32)
-    except Exception:
-        inst = SATInstance.from_dimacs(filepath)
-        pos = np.zeros(inst.n_vars + 1, dtype=np.float32)
-        neg = np.zeros(inst.n_vars + 1, dtype=np.float32)
-        clause_lengths = []
-        for clause in inst.clauses:
-            clause_lengths.append(len(clause))
-            for lit in clause:
-                if lit > 0:
-                    pos[lit] += 1
-                else:
-                    neg[-lit] += 1
-
-        total_lits = float(sum(clause_lengths) or 1)
-        base = np.array([
-            inst.n_vars,
-            inst.n_clauses,
-            inst.n_clauses / max(inst.n_vars, 1),
-            np.mean(clause_lengths) if clause_lengths else 0.0,
-            np.std(clause_lengths) if clause_lengths else 0.0,
-            np.min(clause_lengths) if clause_lengths else 0.0,
-            np.max(clause_lengths) if clause_lengths else 0.0,
-            pos.sum() / total_lits,
-            neg.sum() / total_lits,
-        ], dtype=np.float32)
-        per_var = np.concatenate([
-            (pos[1:] + neg[1:]) / total_lits,
-            (pos[1:] - neg[1:]) / total_lits,
-        ]).astype(np.float32)
-        arr = np.concatenate([base, per_var])
-        if len(arr) >= n_features:
-            arr = arr[:n_features]
-        else:
-            arr = np.pad(arr, (0, n_features - len(arr)))
-        arr = arr / (np.abs(arr).max() + 1e-8)
-        return arr.astype(np.float32)
 
 N_VARS    = 20
 N_CLAUSES = 91

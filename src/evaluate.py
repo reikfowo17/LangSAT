@@ -11,7 +11,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from stable_baselines3 import PPO
 from cdcl_baseline import CDCLSolver, SATInstance
-from smartsat_env import N_VARS, build_solver_observation, extract_sat_features
+from satfeat_adapter import (
+    BACKEND_USAGE,
+    FEATURE_BACKEND,
+    SATFEATPY_DIR,
+    SATFEATPY_FULL_LOCAL_SEARCH,
+    extract_sat_features,
+)
+from smartsat_env import N_VARS, build_solver_observation
 
 
 # Đường dẫn: tự động phát hiện local vs Kaggle
@@ -201,6 +208,10 @@ def compute_metrics(df: pd.DataFrame) -> dict:
         "time_scale"       : round(float(df["time_scale"].iloc[0]), 6) if "time_scale" in df else 1.0,
         "policy_mode"       : SMARTSAT_POLICY_MODE,
         "use_search_time"   : SMARTSAT_USE_SEARCH_TIME,
+        "feature_backend"   : FEATURE_BACKEND,
+        "feature_backend_usage": dict(BACKEND_USAGE),
+        "satfeatpy_dir"     : SATFEATPY_DIR,
+        "satfeatpy_full_local_search": SATFEATPY_FULL_LOCAL_SEARCH,
         "sat_rate_smartsat": round(df["smartsat_sat"].mean() * 100, 2),
         "sat_rate_baseline": round(df["baseline_sat"].mean() * 100, 2),
         "median_decisions_smartsat": round(float(df["smartsat_decisions"].median()), 2),
@@ -224,6 +235,8 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     print(f"  Median SmartSAT      : {metrics['median_smartsat']}s")
     print(f"  Median Baseline      : {metrics['median_baseline']}s")
     print(f"  Policy mode          : {metrics['policy_mode']}")
+    print(f"  Feature backend      : {metrics['feature_backend']}")
+    print(f"  Feature usage        : {metrics['feature_backend_usage']}")
     print(f"  Search-time metric   : {metrics['use_search_time']}")
     print(f"  Baseline budget exits: {metrics['baseline_budget_exits']}")
     print(f"  SmartSAT budget exits: {metrics['smartsat_budget_exits']}")
