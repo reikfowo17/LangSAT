@@ -43,3 +43,32 @@ langsat_reproduce/
 - Train/Test split: `800/200` (80/20)
 - Algorithm: `PPO` (Stable-Baselines3)
 - Dataset: `uf20-91` (20 variables, 91 clauses, 1000 instances)
+
+---
+
+## Lang2Logic → DIMACS → SAT
+
+`lang2logic.py` chuyển English/propositional text thành CNF. Với biểu thức logic đã ở format bài báo, có thể xuất DIMACS và giải bằng solver trong repo:
+
+```python
+from lang2logic import Lang2Logic
+from cdcl_baseline import solve_file
+
+pipeline = Lang2Logic()
+expr = pipeline.parse_expression("And(Or(A, B), Not(A))")
+pipeline.save_dimacs(expr, "results/example.cnf")
+sat, seconds = solve_file("results/example.cnf")
+```
+
+Chạy từ English text cần `OPENAI_API_KEY`, vì bước NL → logic dùng OpenAI API:
+
+```python
+from lang2logic import Lang2Logic
+
+pipeline = Lang2Logic()
+result = pipeline.convert("If A then B. A.")
+with open("results/from_text.cnf", "w", encoding="utf-8") as f:
+    f.write(result["dimacs"]["dimacs"])
+```
+
+Phần benchmark SmartSAT trên `uf20-91` vẫn là thực nghiệm riêng để so sánh heuristic với baseline.
