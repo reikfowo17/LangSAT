@@ -202,8 +202,93 @@ class CDCLSolver:
         decision_policy: Optional[DecisionPolicy] = None,
     ) -> tuple[bool, float]:
         start = time.perf_counter()
-        result = self._search(preferred_literals or [], 0, decision_policy)
+        preferred_literals = preferred_literals or []
+        result = self._cdcl_search(preferred_literals, decision_policy)
+        if result is None:
+            self._clear_state(keep_heuristics=True)
+            result = self._search(preferred_literals, 0, decision_policy)
         return result, time.perf_counter() - start
+
+    def _cdcl_search(
+        self,
+        preferred_literals: list[int],
+        decision_policy: Optional[DecisionPolicy] = None,
+        max_conflicts: int = 250,
+    ) -> Optional[bool]:
+        pref_idx = 0
+        seen_learned: set[tuple[int, ...]] = set()
+
+        while True:
+            conflict = self.unit_propagate()
+            if conflict is not None:
+                if self.current_level == 0:
+                    return False
+                if self.stats.conflicts >= max_conflicts:
+                    return None
+
+                learned, backtrack_level = self._learn_asserting_clause(conflict)
+                key = tuple(sorted(learned))
+                if learned and key not in seen_learned:
+                    self.clauses.append(learned)
+                    seen_learned.add(key)
+                    self.stats.learned_clauses += 1
+
+                self.backtrack(backtrack_level)
+                if len(learned) == 1:
+                    lit = learned[0]
+                    self._enqueue(abs(lit), 1 if lit > 0 else -1, self.current_level, len(self.clauses) - 1)
+                continue
+
+            if all(self.assignment[v] != 0 for v in range(1, self.inst.n_vars + 1)):
+                return True
+
+            decision = self._next_decision(preferred_literals, pref_idx, decision_policy)
+            if decision is None:
+                return True
+
+            var, value, pref_idx = decision
+            self.current_level += 1
+            self.trail_lim.append(len(self.trail))
+            self._enqueue(var, value, self.current_level, reason=None)
+            self.stats.decisions += 1
+
+    def _learn_asserting_clause(self, conflict_ci: int) -> tuple[list[int], int]:
+        conflict_clause = self.clauses[conflict_ci]
+        for lit in conflict_clause:
+            self.vsids.bump(abs(lit))
+
+        learned = []
+        seen = set()
+        for var in reversed(self.trail):
+            if self.decision_level[var] <= 0:
+                continue
+            lit = -var if self.assignment[var] == 1 else var
+            if abs(lit) not in seen:
+                learned.append(lit)
+                seen.add(abs(lit))
+
+        if not learned:
+            learned = list(conflict_clause)
+
+        self.vsids.decay_all()
+        return learned, 0
+
+    def _clear_state(self, keep_heuristics: bool = True):
+        self.assignment = [0] * (self.inst.n_vars + 1)
+        self.decision_level = [-1] * (self.inst.n_vars + 1)
+        self.antecedent = [None] * (self.inst.n_vars + 1)
+        self.trail = []
+        self.trail_lim = []
+        self.current_level = 0
+        self.clauses = [list(c) for c in self.inst.clauses]
+        if not keep_heuristics:
+            self.vsids = VSIDS(self.inst.n_vars)
+            self.literal_bias = [0] * (self.inst.n_vars + 1)
+            for clause in self.clauses:
+                for lit in clause:
+                    var = abs(lit)
+                    self.vsids.activity[var] += 1.0
+                    self.literal_bias[var] += 1 if lit > 0 else -1
 
     def _search(
         self,
