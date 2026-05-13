@@ -1,15 +1,10 @@
 import re
 import os
+from difflib import SequenceMatcher
 from typing import Optional
 
-# NLP
-import nltk
-nltk.download("punkt", quiet=True)
-nltk.download("punkt_tab", quiet=True)
-from nltk.tokenize import sent_tokenize
-
 # Logic parsing
-from lark import Lark, Transformer, Token
+from lark import Lark, Transformer
 
 # Symbolic math
 from sympy.logic.boolalg import BooleanFalse, BooleanTrue, to_cnf, simplify_logic, And, Or, Not, Equivalent, Implies
@@ -18,20 +13,13 @@ from sympy import symbols
 LOGIC_GRAMMAR = r"""
     ?start: expr
 
-    ?expr: or_expr
-         | and_expr
-         | not_expr
-         | implies_expr
-         | equiv_expr
+    ?expr: call
          | atom
 
-    or_expr     : "Or("         expr "," expr ")"
-    and_expr    : "And("        expr "," expr ")"
-    not_expr    : "Not("        expr ")"
-    implies_expr: "Implies("    expr "," expr ")"
-    equiv_expr  : "Equivalent(" expr "," expr ")"
+    call: OP "(" [expr ("," expr)*] ")"
 
     atom : NAME                                          -> var
+    OP   : "Equivalent" | "Implies" | "And" | "Or" | "Not"
     NAME : /[A-Za-z][A-Za-z0-9_]*/
 
     %ignore " "
@@ -54,20 +42,20 @@ class LogicTransformer(Transformer):
     def var(self, items):
         return self._get_sym(str(items[0]))
 
-    def not_expr(self, items):
-        return Not(items[0])
-
-    def or_expr(self, items):
-        return Or(items[0], items[1])
-
-    def and_expr(self, items):
-        return And(items[0], items[1])
-
-    def implies_expr(self, items):
-        return Implies(items[0], items[1])
-
-    def equiv_expr(self, items):
-        return Equivalent(items[0], items[1])
+    def call(self, items):
+        op = str(items[0])
+        args = list(items[1:])
+        if op == "Not" and len(args) == 1:
+            return Not(args[0])
+        if op == "Or" and len(args) >= 2:
+            return Or(*args)
+        if op == "And" and len(args) >= 2:
+            return And(*args)
+        if op == "Implies" and len(args) == 2:
+            return Implies(args[0], args[1])
+        if op == "Equivalent" and len(args) == 2:
+            return Equivalent(args[0], args[1])
+        raise ValueError(f"Invalid {op} arity: expected valid args, got {len(args)}")
 
 class Lang2Logic:
 
@@ -129,28 +117,69 @@ A="A", B="B"
         words = text.split()
         if len(words) > 450:
             text = " ".join(words[:450])
-        sentences = sent_tokenize(text)
+        try:
+            import nltk
+            nltk.download("punkt", quiet=True)
+            nltk.download("punkt_tab", quiet=True)
+            from nltk.tokenize import sent_tokenize
+            sentences = sent_tokenize(text)
+        except Exception:
+            sentences = re.split(r"(?<=[.!?])\s+", text)
         return [s.strip() for s in sentences if s.strip()]
 
     # ---- Step 2: NL → Logical Expression ----
 
-    def _parse_mapping_line(self, line: str):
+    def _normalize_meaning(self, meaning: str) -> str:
+        meaning = meaning.lower().strip()
+        meaning = re.sub(r"\b(the|a|an)\b", " ", meaning)
+        meaning = re.sub(r"[^a-z0-9]+", " ", meaning)
+        meaning = re.sub(r"\s+", " ", meaning).strip()
+        return meaning
+
+    def _same_meaning(self, a: str, b: str) -> bool:
+        na = self._normalize_meaning(a)
+        nb = self._normalize_meaning(b)
+        if not na or not nb:
+            return False
+        return na == nb or SequenceMatcher(None, na, nb).ratio() >= 0.88
+
+    def _find_existing_var_for_meaning(self, meaning: str) -> Optional[str]:
+        for var, known in self._meaning_map.items():
+            if self._same_meaning(meaning, known):
+                return var
+        return None
+
+    def _parse_mapping_line(self, line: str) -> dict[str, str]:
         # parse: A="proposition", B="proposition"
+        replacements = {}
         for match in re.finditer(r'([A-Za-z][A-Za-z0-9_]*)\s*=\s*"([^"]*)"', line):
             var, meaning = match.group(1), match.group(2)
-            if var not in self._meaning_map:
+            existing = self._find_existing_var_for_meaning(meaning)
+            if existing and existing != var:
+                replacements[var] = existing
+            elif var not in self._meaning_map:
                 self._meaning_map[var] = meaning
+        return replacements
+
+    def _mapping_context(self) -> str:
+        if not self._meaning_map:
+            return ""
+        entries = ", ".join(f'{k}="{v}"' for k, v in self._meaning_map.items())
+        return (
+            f"\nAlready assigned variables: {entries}"
+            "\nReuse these exact letters for the SAME proposition."
+            "\nDo NOT invent a new letter for a proposition already listed."
+            "\nUse a NEW letter only for propositions not listed above."
+        )
+
+    def _replace_vars_in_expr(self, expr_str: str, replacements: dict[str, str]) -> str:
+        for old, new in sorted(replacements.items(), key=lambda x: len(x[0]), reverse=True):
+            expr_str = re.sub(rf"\b{re.escape(old)}\b", new, expr_str)
+        return expr_str
 
     def nl_to_logical(self, sentence: str) -> str:
         client = self._get_client()
-        var_context = ""
-        if self._meaning_map:
-            entries = ", ".join(f'{k}="{v}"' for k, v in self._meaning_map.items())
-            var_context = (
-                f"\nAlready assigned variables: {entries}"
-                "\nReuse these exact letters for the SAME proposition."
-                "\nUse a NEW letter for any proposition not listed above."
-            )
+        var_context = self._mapping_context()
         try:
             response = client.chat.completions.create(
                 model=self.model,
@@ -165,9 +194,11 @@ A="A", B="B"
             # Track token usage
             self._api_cost_tokens += response.usage.total_tokens
             lines = [l.strip() for l in raw.splitlines() if l.strip()]
-            expr_str = lines[0] if lines else ""
+            expr_str = self._clean_expression(lines[0]) if lines else ""
             if len(lines) >= 2:
-                self._parse_mapping_line(lines[1])
+                replacements = self._parse_mapping_line(lines[1])
+                if replacements:
+                    expr_str = self._replace_vars_in_expr(expr_str, replacements)
             return expr_str
         except Exception as e:
             print(f"  [API Error] {e}")
@@ -175,8 +206,16 @@ A="A", B="B"
 
     # ---- Step 3: Parse → SymPy ----
 
-    def parse_expression(self, expr_str: str):
+    def _clean_expression(self, expr_str: str) -> str:
         expr_str = expr_str.strip()
+        expr_str = re.sub(r"^```(?:text|python)?", "", expr_str).strip()
+        expr_str = re.sub(r"```$", "", expr_str).strip()
+        if ":" in expr_str and not expr_str.startswith(("Or(", "And(", "Not(", "Implies(", "Equivalent(")):
+            expr_str = expr_str.split(":", 1)[1].strip()
+        return expr_str
+
+    def parse_expression(self, expr_str: str):
+        expr_str = self._clean_expression(expr_str)
         if not expr_str:
             return None
         try:
@@ -222,6 +261,7 @@ A="A", B="B"
     def convert(self, text: str, verbose: bool = True) -> dict:
         self._var_map = {}       # reset variable map cho mỗi input mới
         self._meaning_map = {}   # reset meaning map cho mỗi input mới
+        self._api_cost_tokens = 0
 
         # Step 1: Tokenize
         sentences = self.tokenize(text)
