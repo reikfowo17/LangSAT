@@ -9,6 +9,10 @@ from typing import Optional
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cdcl_baseline import SATInstance, CDCLSolver
 
+
+_BASELINE_DECISION_CACHE: dict[str, int] = {}
+
+
 def extract_sat_features(filepath: str, n_features: int = 48) -> np.ndarray:
     try:
         from satfeatpy import SATInstance as SFInst
@@ -134,6 +138,7 @@ class SmartSATEnv(gym.Env):
         self._max_steps = N_VARS * 2   # Tối đa 40 steps, tránh episode chạy vô hạn
         self._global_features = np.zeros(N_GLOBAL, dtype=np.float32)
         self.preferred_literals: list[int] = []
+        self._baseline_decisions = N_VARS
 
     # ---- Helpers ----
 
@@ -142,19 +147,28 @@ class SmartSATEnv(gym.Env):
         inst = SATInstance.from_dimacs(filepath)
         self._solver = CDCLSolver(inst)
         self._global_features = extract_sat_features(filepath, N_GLOBAL)
+        self._baseline_decisions = baseline_decisions(filepath)
 
     def _get_obs(self) -> np.ndarray:
         return build_solver_observation(self._solver, self._global_features)
 
     def _compute_reward(self) -> float:
-        reward = 0.0
+        satisfied = 0
+        unsatisfied = 0
         for clause in self._solver.clauses[:N_CLAUSES]:
             vals = [self._solver._lit_value(lit) for lit in clause]
             if 1 in vals:
-                reward += 1.0
+                satisfied += 1
             elif all(v == -1 for v in vals):
-                reward -= 1.0
-        return reward
+                unsatisfied += 1
+        return (satisfied / N_CLAUSES) - float(unsatisfied)
+
+    def _terminal_reward(self, sat: bool) -> float:
+        if not sat:
+            return -20.0 - self._step_count
+        baseline = max(self._baseline_decisions, 1)
+        decision_delta = baseline - self._solver.stats.decisions
+        return 20.0 + (2.0 * decision_delta) - (0.5 * self._solver.stats.conflicts)
 
     # ---- Gym Interface ----
 
@@ -192,7 +206,7 @@ class SmartSATEnv(gym.Env):
             if not unassigned:
                 # Tất cả biến đã gán → kết thúc
                 sat = self._check_sat()
-                reward = self._compute_reward()
+                reward = self._terminal_reward(sat)
                 self._done = True
                 return self._get_obs(), reward, True, False, {"sat": sat}
             var = unassigned[0]
@@ -216,9 +230,8 @@ class SmartSATEnv(gym.Env):
         if conflict_ci is not None:
             if solver.current_level == 0:
                 # UNSAT
-                reward = self._compute_reward()
                 self._done = True
-                return self._get_obs(), reward, True, False, {"sat": False}
+                return self._get_obs(), self._terminal_reward(False), True, False, {"sat": False}
 
             learned, btlevel = solver.analyze_conflict(conflict_ci)
             solver.backtrack(btlevel)
@@ -235,20 +248,19 @@ class SmartSATEnv(gym.Env):
                     conflict_ci2 = solver.unit_propagate()
                     if conflict_ci2 is not None:
                         self._done = True
-                        return self._get_obs(), self._compute_reward(), True, False, {"sat": False}
+                        return self._get_obs(), self._terminal_reward(False), True, False, {"sat": False}
 
         # Kiểm tra SAT
         sat = self._check_sat()
         if sat:
-            reward = self._compute_reward()
             self._done = True
-            return self._get_obs(), reward, True, False, {"sat": True}
+            return self._get_obs(), self._terminal_reward(True), True, False, {"sat": True}
 
-        reward = self._compute_reward()
+        reward = self._compute_reward() - 0.05 - (0.25 if conflict_ci is not None else 0.0)
 
         # Truncation: episode quá dài → dừng lại
         if self._step_count >= self._max_steps:
-            return self._get_obs(), reward, False, True, {
+            return self._get_obs(), reward - 5.0, False, True, {
                 "truncated": True,
                 "preferred_literals": list(self.preferred_literals),
             }
@@ -268,3 +280,15 @@ class SmartSATEnv(gym.Env):
 
     def close(self):
         pass
+
+
+def baseline_decisions(filepath: str) -> int:
+    cached = _BASELINE_DECISION_CACHE.get(filepath)
+    if cached is not None:
+        return cached
+    inst = SATInstance.from_dimacs(filepath)
+    solver = CDCLSolver(inst)
+    solver.solve()
+    decisions = max(solver.stats.decisions, 1)
+    _BASELINE_DECISION_CACHE[filepath] = decisions
+    return decisions
