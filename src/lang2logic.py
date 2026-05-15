@@ -63,7 +63,9 @@ class Lang2Logic:
     SYSTEM_PROMPT = """You are a logic translator. Convert the given English sentence into a propositional logic expression.
 
 Rules:
-1. Use ONLY these operators: Or(X, Y), And(X, Y), Not(X), Implies(X, Y), Equivalent(X, Y)
+1. Use ONLY these 5 operators, no exceptions:
+   Or(X, Y), And(X, Y), Not(X), Implies(X, Y), Equivalent(X, Y)
+   Any expression using other operators (Xor, Nor, Nand, Xnor, ...) must be rewritten using only these 5.
 2. Use single uppercase letters as variables (A, B, C, ...).
 3. Output EXACTLY two lines, no extra text:
    Line 1: the logical expression
@@ -72,6 +74,7 @@ Rules:
 5. Always define variables as POSITIVE propositions. Never use
    'not', 'does not', 'cannot', 'no' in a variable's meaning.
    Use the Not() operator to express negation instead.
+
 
 Examples:
 Input: "A or B"
@@ -93,6 +96,14 @@ Input: "The circus does not have a carousel if and only if it has a ferris wheel
 Output:
 Equivalent(Not(C), F)
 C="The circus has a carousel", F="The circus has a ferris wheel"
+
+Input: "Either A or B, but not both."
+Wrong output:
+Xor(A, B)
+
+Correct output:
+And(Or(A, B), Not(And(A, B)))
+A="A", B="B"
 """
 
     def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4o-mini"):
