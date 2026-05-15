@@ -69,6 +69,9 @@ Rules:
    Line 1: the logical expression
    Line 2: mapping of every variable used, format: X="proposition", Y="proposition"
 4. No explanation, no markdown.
+5. Always define variables as POSITIVE propositions. Never use
+   'not', 'does not', 'cannot', 'no' in a variable's meaning.
+   Use the Not() operator to express negation instead.
 
 Examples:
 Input: "A or B"
