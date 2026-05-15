@@ -17,6 +17,13 @@ from stable_baselines3.common.monitor import Monitor
 
 from smartsat_env import SmartSATEnv
 
+try:
+    from sb3_contrib import MaskablePPO
+    from sb3_contrib.common.wrappers import ActionMasker
+except Exception:
+    MaskablePPO = None
+    ActionMasker = None
+
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _IS_KAGGLE = os.path.exists("/kaggle/working")
 
@@ -147,13 +154,16 @@ def train_smartsat(train_files: list[str]) -> tuple:
     def make_env():
         env = SmartSATEnv(train_files)
         env = Monitor(env)
+        if ActionMasker is not None:
+            env = ActionMasker(env, lambda e: e.action_masks())
         return env
 
     # Vectorized environment (1 env đủ cho bài báo)
     vec_env = make_vec_env(make_env, n_envs=1, seed=SEED)
 
-    # PPO model
-    model = PPO(
+    # PPO model; prefer action masking when sb3-contrib is available.
+    model_cls = MaskablePPO if MaskablePPO is not None else PPO
+    model_kwargs = dict(
         policy="MlpPolicy",
         env=vec_env,
         learning_rate=LEARNING_RATE,
@@ -167,6 +177,12 @@ def train_smartsat(train_files: list[str]) -> tuple:
         seed=SEED,
         tensorboard_log=os.path.join(OUTPUT_DIR, "tb_logs"),
     )
+    if model_cls is MaskablePPO:
+        print("[Train] Using MaskablePPO action masking.")
+        model = model_cls(**model_kwargs)
+    else:
+        print("[Train] sb3-contrib unavailable; falling back to PPO without masking.")
+        model = model_cls(**model_kwargs)
 
     # Callbacks
     reward_callback = RewardLoggerCallback(

@@ -20,6 +20,11 @@ from satfeat_adapter import (
 )
 from smartsat_env import N_VARS, build_solver_observation
 
+try:
+    from sb3_contrib import MaskablePPO
+except Exception:
+    MaskablePPO = None
+
 
 # Đường dẫn: tự động phát hiện local vs Kaggle
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -54,6 +59,20 @@ def _time_scale(df: pd.DataFrame) -> float:
     return PAPER_MEDIAN_SECONDS / float(np.mean(positive))
 
 
+def _predict_action(model, obs, action_masks=None):
+    if action_masks is not None and MaskablePPO is not None and model.__class__.__name__ == "MaskablePPO":
+        action, _ = model.predict(obs, deterministic=True, action_masks=action_masks)
+        return action
+    if action_masks is not None and hasattr(model, "predict"):
+        try:
+            action, _ = model.predict(obs, deterministic=True, action_masks=action_masks)
+            return action
+        except TypeError:
+            pass
+    action, _ = model.predict(obs, deterministic=True)
+    return action
+
+
 def solve_with_smartsat(filepath: str, model: PPO) -> tuple[bool, float, dict]:
     inst = SATInstance.from_dimacs(filepath)
     solver = CDCLSolver(inst)
@@ -69,8 +88,16 @@ def solve_with_smartsat(filepath: str, model: PPO) -> tuple[bool, float, dict]:
             return None
 
         obs = build_solver_observation(current_solver, global_features)
+        action_masks = None
+        if hasattr(current_solver, "assignment"):
+            mask = np.zeros(N_VARS * 2, dtype=np.int8)
+            for var in range(1, min(current_solver.inst.n_vars, N_VARS) + 1):
+                if current_solver.assignment[var] == 0:
+                    mask[(var - 1) * 2] = 1
+                    mask[(var - 1) * 2 + 1] = 1
+            action_masks = mask
         start = time.perf_counter()
-        action, _ = model.predict(obs, deterministic=True)
+        action = _predict_action(model, obs, action_masks)
         policy_time += time.perf_counter() - start
         action = int(action)
         var = action // 2 + 1
@@ -385,8 +412,16 @@ if __name__ == "__main__":
             f"Model không tìm thấy tại {MODEL_PATH}.zip\n"
             "Hãy chạy training_pipeline.py trước."
         )
-    model = PPO.load(MODEL_PATH)
-    print(f"[Eval] Model loaded từ {MODEL_PATH}.zip")
+    if MaskablePPO is not None:
+        try:
+            model = MaskablePPO.load(MODEL_PATH)
+            print(f"[Eval] MaskablePPO model loaded từ {MODEL_PATH}.zip")
+        except Exception:
+            model = PPO.load(MODEL_PATH)
+            print(f"[Eval] PPO model loaded từ {MODEL_PATH}.zip")
+    else:
+        model = PPO.load(MODEL_PATH)
+        print(f"[Eval] PPO model loaded từ {MODEL_PATH}.zip")
 
     # 3. Evaluate
     df = evaluate(test_files, model)

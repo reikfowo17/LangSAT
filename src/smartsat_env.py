@@ -25,6 +25,7 @@ MAX_STEPS = int(os.environ.get("LANGSAT_ENV_MAX_STEPS", str(N_VARS * 10)))
 
 OBS_SIZE = N_VARS + N_CLAUSES + N_VARS * N_CLAUSES + N_GLOBAL
 # 20 + 91 + 1820 + 48 = 1979
+INVALID_ACTION_PENALTY = float(os.environ.get("LANGSAT_INVALID_ACTION_PENALTY", "2.0"))
 
 
 def build_solver_observation(
@@ -95,6 +96,7 @@ class SmartSATEnv(gym.Env):
         self._baseline_decisions = N_VARS
         self._invalid_actions = 0
         self._fallback_actions = 0
+        self._last_action_mask = np.ones(N_VARS * 2, dtype=np.int8)
 
     # ---- Helpers ----
 
@@ -109,6 +111,20 @@ class SmartSATEnv(gym.Env):
 
     def _get_obs(self) -> np.ndarray:
         return build_solver_observation(self._solver, self._global_features)
+
+    def _compute_action_mask(self) -> np.ndarray:
+        mask = np.zeros(N_VARS * 2, dtype=np.int8)
+        solver = self._solver
+        if solver is None:
+            return mask
+        for var in range(1, min(self._solver.inst.n_vars, N_VARS) + 1):
+            if solver.assignment[var] == 0:
+                mask[(var - 1) * 2] = 1
+                mask[(var - 1) * 2 + 1] = 1
+        return mask
+
+    def action_masks(self) -> np.ndarray:
+        return self._last_action_mask.copy()
 
     def _compute_reward(self) -> float:
         satisfied = 0
@@ -149,6 +165,7 @@ class SmartSATEnv(gym.Env):
 
         # Unit propagation ban đầu (level 0)
         self._solver._find_initial_units()
+        self._last_action_mask = self._compute_action_mask()
 
         obs = self._get_obs()
         return obs, {}
@@ -159,13 +176,15 @@ class SmartSATEnv(gym.Env):
             return obs, 0.0, True, False, {}
 
         solver = self._solver
+        self._last_action_mask = self._compute_action_mask()
         var_idx = action // 2
         value   = 1 if action % 2 == 1 else -1
         var     = var_idx + 1
+        invalid_action = var_idx < 0 or var_idx >= N_VARS or solver.assignment[var] != 0
 
-        # Match evaluation: invalid policy actions fall back to the baseline
-        # branching heuristic instead of silently choosing the first variable.
-        if solver.assignment[var] != 0:
+        # Invalid policy actions are penalized and replaced by the baseline
+        # branching heuristic so training can still continue.
+        if invalid_action:
             self._invalid_actions += 1
             fallback = solver.pick_branching_variable()
             if fallback is None:
@@ -223,11 +242,14 @@ class SmartSATEnv(gym.Env):
             return self._get_obs(), self._terminal_reward(True), True, False, self._info(sat=True)
 
         reward = self._compute_reward() - STEP_PENALTY - (CONFLICT_PENALTY if conflict_ci is not None else 0.0)
+        if invalid_action:
+            reward -= INVALID_ACTION_PENALTY
 
         # Truncation: episode quá dài → dừng lại
         if self._step_count >= self._max_steps:
             return self._get_obs(), reward - TRUNCATION_PENALTY, False, True, self._info(truncated=True)
 
+        self._last_action_mask = self._compute_action_mask()
         return self._get_obs(), reward, False, False, {}
 
     def _info(self, sat: Optional[bool] = None, truncated: bool = False) -> dict:
