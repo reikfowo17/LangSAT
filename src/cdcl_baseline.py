@@ -8,6 +8,7 @@ DEFAULT_MAX_CONFLICTS = int(os.environ.get("LANGSAT_SOLVER_MAX_CONFLICTS", "250"
 DEFAULT_MAX_SECONDS = float(os.environ.get("LANGSAT_SOLVER_MAX_SECONDS", "5.0"))
 DEFAULT_MAX_DECISIONS = int(os.environ.get("LANGSAT_SOLVER_MAX_DECISIONS", "20000"))
 USE_PYSAT_FALLBACK = os.environ.get("LANGSAT_USE_PYSAT", "1") == "1"
+PYSAT_TIME_MODE = os.environ.get("LANGSAT_PYSAT_TIME_MODE", "include").lower()
 
 
 class SATInstance:
@@ -213,6 +214,8 @@ class CDCLSolver:
         max_conflicts: int = DEFAULT_MAX_CONFLICTS,
         max_seconds: float = DEFAULT_MAX_SECONDS,
         max_decisions: int = DEFAULT_MAX_DECISIONS,
+        use_pysat_fallback: Optional[bool] = None,
+        pysat_time_mode: str = PYSAT_TIME_MODE,
     ) -> tuple[bool, float]:
         start = time.perf_counter()
         preferred_literals = preferred_literals or []
@@ -225,13 +228,22 @@ class CDCLSolver:
             deadline=deadline,
         )
         if result is None:
+            budget_elapsed = time.perf_counter() - start
             self.stats.budget_exceeded = True
             if deadline is not None and time.perf_counter() >= deadline:
                 self.stats.timed_out = True
-            pysat_result = self._solve_with_pysat()
+            if use_pysat_fallback is None:
+                use_pysat_fallback = USE_PYSAT_FALLBACK
+            pysat_result = self._solve_with_pysat() if use_pysat_fallback else None
             if pysat_result is not None:
                 result = pysat_result
                 self.stats.engine = "pysat_minisat22"
+                elapsed = time.perf_counter() - start
+                if pysat_time_mode == "budget":
+                    elapsed = budget_elapsed
+                elif pysat_time_mode == "timeout" and max_seconds and max_seconds > 0:
+                    elapsed = max(float(max_seconds), budget_elapsed)
+                return result, elapsed
             else:
                 raise RuntimeError(
                     "Python CDCL solver exceeded its safety budget and PySAT "
@@ -427,6 +439,8 @@ def solve_file(
     max_conflicts: int = DEFAULT_MAX_CONFLICTS,
     max_seconds: float = DEFAULT_MAX_SECONDS,
     max_decisions: int = DEFAULT_MAX_DECISIONS,
+    use_pysat_fallback: Optional[bool] = None,
+    pysat_time_mode: str = PYSAT_TIME_MODE,
 ) -> tuple[bool, float]:
     inst = SATInstance.from_dimacs(filepath)
     solver = CDCLSolver(inst)
@@ -436,6 +450,8 @@ def solve_file(
         max_conflicts=max_conflicts,
         max_seconds=max_seconds,
         max_decisions=max_decisions,
+        use_pysat_fallback=use_pysat_fallback,
+        pysat_time_mode=pysat_time_mode,
     )
 
 

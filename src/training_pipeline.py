@@ -31,6 +31,8 @@ TOTAL_STEPS    = int(os.environ.get("LANGSAT_TOTAL_STEPS", "100000"))  # 1 epoch
 TRAIN_RATIO    = 0.8              # 800 train / 200 test
 SEED           = 42
 CHECKPOINT_FREQ = 10_000          # Lưu checkpoint mỗi 10k steps
+TRAIN_LOG_INTERVAL = int(os.environ.get("LANGSAT_TRAIN_LOG_INTERVAL", "5000"))
+TRAIN_HEARTBEAT_SECONDS = float(os.environ.get("LANGSAT_TRAIN_HEARTBEAT_SECONDS", "60"))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -78,12 +80,20 @@ def load_and_split_dataset(data_dir: str, train_ratio: float = 0.8):
     return train_files, test_files
 
 class RewardLoggerCallback(BaseCallback):
-    def __init__(self, log_interval: int = 1000, verbose: int = 0):
+    def __init__(
+        self,
+        log_interval: int = 1000,
+        heartbeat_seconds: float = 60.0,
+        verbose: int = 0,
+    ):
         super().__init__(verbose)
         self.log_interval = log_interval
+        self.heartbeat_seconds = heartbeat_seconds
         self.rewards = []
         self.steps_log = []
         self._ep_rewards = []
+        self._last_logged_step = 0
+        self._last_heartbeat_time = time.time()
 
     def _on_step(self) -> bool:
         # Lấy reward từ infos
@@ -92,14 +102,33 @@ class RewardLoggerCallback(BaseCallback):
             if ep_info:
                 self._ep_rewards.append(ep_info["r"])
 
-        if self.num_timesteps % self.log_interval == 0 and self._ep_rewards:
-            mean_r = np.mean(self._ep_rewards[-50:])   # mean 50 episodes gần nhất
-            self.rewards.append(mean_r)
-            self.steps_log.append(self.num_timesteps)
+        should_log_step = self.num_timesteps - self._last_logged_step >= self.log_interval
+        if should_log_step and self._ep_rewards:
+            self._last_logged_step = self.num_timesteps
+            self._record_reward()
+
+        now = time.time()
+        should_heartbeat = now - self._last_heartbeat_time >= self.heartbeat_seconds
+        if should_heartbeat:
+            self._last_heartbeat_time = now
             if self.verbose:
-                print(f"  Step {self.num_timesteps:>7} | Mean Reward (last 50 ep): {mean_r:.2f}")
+                if self._ep_rewards:
+                    mean_r = np.mean(self._ep_rewards[-50:])
+                    print(
+                        f"  Step {self.num_timesteps:>7} | Mean Reward (last 50 ep): {mean_r:.2f}",
+                        flush=True,
+                    )
+                else:
+                    print(f"  Step {self.num_timesteps:>7} | waiting for completed episodes", flush=True)
 
         return True
+
+    def _record_reward(self):
+        mean_r = np.mean(self._ep_rewards[-50:])   # mean 50 episodes gần nhất
+        self.rewards.append(mean_r)
+        self.steps_log.append(self.num_timesteps)
+        if self.verbose:
+            print(f"  Step {self.num_timesteps:>7} | Mean Reward (last 50 ep): {mean_r:.2f}", flush=True)
 
     def save_log(self, path: str):
         log = {"steps": self.steps_log, "mean_rewards": self.rewards}
@@ -134,22 +163,26 @@ def train_smartsat(train_files: list[str]) -> tuple:
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        verbose=1,
+        verbose=0,
         seed=SEED,
         tensorboard_log=os.path.join(OUTPUT_DIR, "tb_logs"),
     )
 
     # Callbacks
-    reward_callback = RewardLoggerCallback(log_interval=1000, verbose=1)
+    reward_callback = RewardLoggerCallback(
+        log_interval=TRAIN_LOG_INTERVAL,
+        heartbeat_seconds=TRAIN_HEARTBEAT_SECONDS,
+        verbose=1,
+    )
 
-    print(f"[Train] Bắt đầu training...")
+    print(f"[Train] Bắt đầu training...", flush=True)
     start_time = time.time()
 
     try:
         model.learn(
             total_timesteps=TOTAL_STEPS,
             callback=reward_callback,
-            progress_bar=True,
+            progress_bar=False,
         )
     finally:
         vec_env.close()

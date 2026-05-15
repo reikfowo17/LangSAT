@@ -10,7 +10,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from stable_baselines3 import PPO
-from cdcl_baseline import CDCLSolver, SATInstance
+from cdcl_baseline import CDCLSolver, PYSAT_TIME_MODE, SATInstance
 from satfeat_adapter import (
     BACKEND_USAGE,
     FEATURE_BACKEND,
@@ -37,6 +37,9 @@ TIME_SCALE = float(os.environ.get("LANGSAT_TIME_SCALE", "1.0"))
 REPORT_SCALE_TO_PAPER = os.environ.get("LANGSAT_REPORT_SCALE_TO_PAPER", "0") == "1"
 SMARTSAT_POLICY_MODE = os.environ.get("LANGSAT_POLICY_MODE", "rl").lower()
 SMARTSAT_USE_SEARCH_TIME = os.environ.get("LANGSAT_USE_SEARCH_TIME", "0") == "1"
+BASELINE_USE_PYSAT = os.environ.get("LANGSAT_BASELINE_USE_PYSAT", os.environ.get("LANGSAT_USE_PYSAT", "1")) == "1"
+SMARTSAT_USE_PYSAT = os.environ.get("LANGSAT_SMARTSAT_USE_PYSAT", os.environ.get("LANGSAT_USE_PYSAT", "1")) == "1"
+PAPERLIKE_PYSAT_TIME_MODE = os.environ.get("LANGSAT_PYSAT_TIME_MODE", PYSAT_TIME_MODE).lower()
 
 
 def _time_scale(df: pd.DataFrame) -> float:
@@ -87,7 +90,11 @@ def solve_with_smartsat(filepath: str, model: PPO) -> tuple[bool, float, dict]:
         fallback_decisions += 1
         return baseline_var, baseline_value
 
-    sat, elapsed = solver.solve(decision_policy=policy)
+    sat, elapsed = solver.solve(
+        decision_policy=policy,
+        use_pysat_fallback=SMARTSAT_USE_PYSAT,
+        pysat_time_mode=PAPERLIKE_PYSAT_TIME_MODE,
+    )
     search_elapsed = max(elapsed - policy_time, 0.0)
     return sat, elapsed, {
         "search_time_raw": search_elapsed,
@@ -108,7 +115,10 @@ def solve_with_smartsat(filepath: str, model: PPO) -> tuple[bool, float, dict]:
 def solve_baseline_with_stats(filepath: str) -> tuple[bool, float, dict]:
     inst = SATInstance.from_dimacs(filepath)
     solver = CDCLSolver(inst)
-    sat, elapsed = solver.solve()
+    sat, elapsed = solver.solve(
+        use_pysat_fallback=BASELINE_USE_PYSAT,
+        pysat_time_mode=PAPERLIKE_PYSAT_TIME_MODE,
+    )
     return sat, elapsed, {
         "decisions": solver.stats.decisions,
         "propagations": solver.stats.propagations,
@@ -208,6 +218,9 @@ def compute_metrics(df: pd.DataFrame) -> dict:
         "time_scale"       : round(float(df["time_scale"].iloc[0]), 6) if "time_scale" in df else 1.0,
         "policy_mode"       : SMARTSAT_POLICY_MODE,
         "use_search_time"   : SMARTSAT_USE_SEARCH_TIME,
+        "baseline_use_pysat": BASELINE_USE_PYSAT,
+        "smartsat_use_pysat": SMARTSAT_USE_PYSAT,
+        "pysat_time_mode"   : PAPERLIKE_PYSAT_TIME_MODE,
         "feature_backend"   : FEATURE_BACKEND,
         "feature_backend_usage": dict(BACKEND_USAGE),
         "satfeatpy_dir"     : SATFEATPY_DIR,
@@ -238,6 +251,7 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     print(f"  Feature backend      : {metrics['feature_backend']}")
     print(f"  Feature usage        : {metrics['feature_backend_usage']}")
     print(f"  Search-time metric   : {metrics['use_search_time']}")
+    print(f"  PySAT time mode      : {metrics['pysat_time_mode']}")
     print(f"  Baseline budget exits: {metrics['baseline_budget_exits']}")
     print(f"  SmartSAT budget exits: {metrics['smartsat_budget_exits']}")
     print(f"  PySAT fallbacks B/ST : {metrics['baseline_pysat_fallbacks']}/{metrics['smartsat_pysat_fallbacks']}")

@@ -155,17 +155,17 @@ class SmartSATEnv(gym.Env):
         value   = 1 if action % 2 == 1 else -1
         var     = var_idx + 1
 
-        # Nếu biến đã gán → chọn biến chưa gán đầu tiên thay thế
+        # Match evaluation: invalid policy actions fall back to the baseline
+        # branching heuristic instead of silently choosing the first variable.
         if solver.assignment[var] != 0:
-            unassigned = [v for v in range(1, N_VARS + 1)
-                          if solver.assignment[v] == 0]
-            if not unassigned:
+            fallback = solver.pick_branching_variable()
+            if fallback is None:
                 # Tất cả biến đã gán → kết thúc
                 sat = self._check_sat()
                 reward = self._terminal_reward(sat)
                 self._done = True
                 return self._get_obs(), reward, True, False, {"sat": sat}
-            var = unassigned[0]
+            var, value = fallback
 
         lit = var if value == 1 else -var
         if lit not in self.preferred_literals and -lit not in self.preferred_literals:
