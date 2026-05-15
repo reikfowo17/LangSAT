@@ -18,6 +18,10 @@ N_VARS    = 20
 N_CLAUSES = 91
 N_GLOBAL  = 48
 REWARD_MODE = os.environ.get("LANGSAT_REWARD_MODE", "paper").lower()
+STEP_PENALTY = float(os.environ.get("LANGSAT_STEP_PENALTY", "0.0"))
+CONFLICT_PENALTY = float(os.environ.get("LANGSAT_CONFLICT_PENALTY", "0.0"))
+TRUNCATION_PENALTY = float(os.environ.get("LANGSAT_TRUNCATION_PENALTY", "5.0"))
+MAX_STEPS = int(os.environ.get("LANGSAT_ENV_MAX_STEPS", str(N_VARS * 10)))
 
 OBS_SIZE = N_VARS + N_CLAUSES + N_VARS * N_CLAUSES + N_GLOBAL
 # 20 + 91 + 1820 + 48 = 1979
@@ -85,10 +89,12 @@ class SmartSATEnv(gym.Env):
         self._filepath: Optional[str] = None
         self._done = False
         self._step_count = 0
-        self._max_steps = N_VARS * 2   # Tối đa 40 steps, tránh episode chạy vô hạn
+        self._max_steps = MAX_STEPS
         self._global_features = np.zeros(N_GLOBAL, dtype=np.float32)
         self.preferred_literals: list[int] = []
         self._baseline_decisions = N_VARS
+        self._invalid_actions = 0
+        self._fallback_actions = 0
 
     # ---- Helpers ----
 
@@ -138,6 +144,8 @@ class SmartSATEnv(gym.Env):
         self._done = False
         self._step_count = 0
         self.preferred_literals = []
+        self._invalid_actions = 0
+        self._fallback_actions = 0
 
         # Unit propagation ban đầu (level 0)
         self._solver._find_initial_units()
@@ -158,13 +166,15 @@ class SmartSATEnv(gym.Env):
         # Match evaluation: invalid policy actions fall back to the baseline
         # branching heuristic instead of silently choosing the first variable.
         if solver.assignment[var] != 0:
+            self._invalid_actions += 1
             fallback = solver.pick_branching_variable()
             if fallback is None:
                 # Tất cả biến đã gán → kết thúc
                 sat = self._check_sat()
                 reward = self._terminal_reward(sat)
                 self._done = True
-                return self._get_obs(), reward, True, False, {"sat": sat}
+                return self._get_obs(), reward, True, False, self._info(sat=sat)
+            self._fallback_actions += 1
             var, value = fallback
 
         lit = var if value == 1 else -var
@@ -187,7 +197,7 @@ class SmartSATEnv(gym.Env):
             if solver.current_level == 0:
                 # UNSAT
                 self._done = True
-                return self._get_obs(), self._terminal_reward(False), True, False, {"sat": False}
+                return self._get_obs(), self._terminal_reward(False), True, False, self._info(sat=False)
 
             learned, btlevel = solver.analyze_conflict(conflict_ci)
             solver.backtrack(btlevel)
@@ -204,24 +214,34 @@ class SmartSATEnv(gym.Env):
                     conflict_ci2 = solver.unit_propagate()
                     if conflict_ci2 is not None:
                         self._done = True
-                        return self._get_obs(), self._terminal_reward(False), True, False, {"sat": False}
+                        return self._get_obs(), self._terminal_reward(False), True, False, self._info(sat=False)
 
         # Kiểm tra SAT
         sat = self._check_sat()
         if sat:
             self._done = True
-            return self._get_obs(), self._terminal_reward(True), True, False, {"sat": True}
+            return self._get_obs(), self._terminal_reward(True), True, False, self._info(sat=True)
 
-        reward = self._compute_reward() - 0.05 - (0.25 if conflict_ci is not None else 0.0)
+        reward = self._compute_reward() - STEP_PENALTY - (CONFLICT_PENALTY if conflict_ci is not None else 0.0)
 
         # Truncation: episode quá dài → dừng lại
         if self._step_count >= self._max_steps:
-            return self._get_obs(), reward - 5.0, False, True, {
-                "truncated": True,
-                "preferred_literals": list(self.preferred_literals),
-            }
+            return self._get_obs(), reward - TRUNCATION_PENALTY, False, True, self._info(truncated=True)
 
         return self._get_obs(), reward, False, False, {}
+
+    def _info(self, sat: Optional[bool] = None, truncated: bool = False) -> dict:
+        info = {
+            "steps": self._step_count,
+            "invalid_actions": self._invalid_actions,
+            "fallback_actions": self._fallback_actions,
+            "preferred_literals": list(self.preferred_literals),
+        }
+        if sat is not None:
+            info["sat"] = sat
+        if truncated:
+            info["truncated"] = True
+        return info
 
     def _check_sat(self) -> bool:
         solver = self._solver

@@ -76,6 +76,66 @@ class SolveStats:
 DecisionPolicy = Callable[["CDCLSolver"], Optional[tuple[int, int]]]
 
 
+def _contains_var(clause: list[int], var: int) -> bool:
+    return any(abs(lit) == var for lit in clause)
+
+
+def _count_current_level_literals(
+    clause: list[int],
+    decision_level: list[int],
+    current_level: int,
+) -> int:
+    seen = set()
+    count = 0
+    for lit in clause:
+        var = abs(lit)
+        if var in seen:
+            continue
+        seen.add(var)
+        if decision_level[var] == current_level:
+            count += 1
+    return count
+
+
+def _dedupe_clause(clause: list[int]) -> list[int]:
+    seen = set()
+    deduped = []
+    for lit in clause:
+        var = abs(lit)
+        if -lit in seen:
+            continue
+        if lit not in seen:
+            seen.add(lit)
+            deduped.append(lit)
+    return deduped
+
+
+def _resolve_clause(left: list[int], right: list[int], pivot_var: int) -> list[int]:
+    merged = [
+        lit
+        for lit in left
+        if abs(lit) != pivot_var
+    ]
+    merged.extend(lit for lit in right if abs(lit) != pivot_var)
+    return _dedupe_clause(merged)
+
+
+def _backtrack_level(
+    learned: list[int],
+    decision_level: list[int],
+    current_level: int,
+) -> int:
+    levels = sorted(
+        {
+            decision_level[abs(lit)]
+            for lit in learned
+            if decision_level[abs(lit)] >= 0 and decision_level[abs(lit)] != current_level
+        },
+        reverse=True,
+    )
+    return levels[0] if levels else 0
+
+
 class CDCLSolver:
     """CDCL-style SAT solver with a pluggable decision policy.
 
@@ -179,15 +239,7 @@ class CDCLSolver:
         return self.unit_propagate()
 
     def analyze_conflict(self, conflict_ci: int) -> tuple[list[int], int]:
-        clause = self.clauses[conflict_ci]
-        learned = []
-        for lit in clause:
-            var = abs(lit)
-            if self.assignment[var] != 0:
-                learned.append(-var if self.assignment[var] == 1 else var)
-                self.vsids.bump(var)
-        self.vsids.decay_all()
-        return learned or list(clause), max(0, self.current_level - 1)
+        return self._learn_asserting_clause(conflict_ci)
 
     def backtrack(self, level: int):
         while self.trail and self.decision_level[self.trail[-1]] > level:
@@ -275,7 +327,7 @@ class CDCLSolver:
                 if self.stats.conflicts >= max_conflicts:
                     return None
 
-                learned, backtrack_level = self._learn_asserting_clause(conflict)
+                learned, backtrack_level = self.analyze_conflict(conflict)
                 key = tuple(sorted(learned))
                 if learned and key not in seen_learned:
                     self.clauses.append(learned)
@@ -326,25 +378,35 @@ class CDCLSolver:
             return None
 
     def _learn_asserting_clause(self, conflict_ci: int) -> tuple[list[int], int]:
-        conflict_clause = self.clauses[conflict_ci]
-        for lit in conflict_clause:
+        learned = list(self.clauses[conflict_ci])
+        for lit in learned:
             self.vsids.bump(abs(lit))
 
-        learned = []
-        seen = set()
-        for var in reversed(self.trail):
-            if self.decision_level[var] <= 0:
-                continue
-            lit = -var if self.assignment[var] == 1 else var
-            if abs(lit) not in seen:
-                learned.append(lit)
-                seen.add(abs(lit))
+        if self.current_level > 0:
+            trail_idx = len(self.trail) - 1
+            while _count_current_level_literals(learned, self.decision_level, self.current_level) > 1:
+                pivot_var = None
+                while trail_idx >= 0:
+                    candidate = self.trail[trail_idx]
+                    trail_idx -= 1
+                    if self.decision_level[candidate] == self.current_level and _contains_var(learned, candidate):
+                        pivot_var = candidate
+                        break
+                if pivot_var is None:
+                    break
 
+                antecedent_ci = self.antecedent[pivot_var]
+                if antecedent_ci is None:
+                    continue
+                learned = _resolve_clause(learned, self.clauses[antecedent_ci], pivot_var)
+
+        learned = _dedupe_clause(learned)
         if not learned:
-            learned = list(conflict_clause)
-
+            learned = list(self.clauses[conflict_ci])
+        for lit in learned:
+            self.vsids.bump(abs(lit))
         self.vsids.decay_all()
-        return learned, 0
+        return learned, _backtrack_level(learned, self.decision_level, self.current_level)
 
     def _clear_state(self, keep_heuristics: bool = True):
         self.assignment = [0] * (self.inst.n_vars + 1)
