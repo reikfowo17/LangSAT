@@ -155,7 +155,7 @@ def train_smartsat(train_files: list[str]) -> tuple:
         env = SmartSATEnv(train_files)
         env = Monitor(env)
         if ActionMasker is not None:
-            env = ActionMasker(env, lambda e: e.action_masks())
+            env = ActionMasker(env, lambda e: e.unwrapped.action_masks())
         return env
 
     # Vectorized environment (1 env đủ cho bài báo)
