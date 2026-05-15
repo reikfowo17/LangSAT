@@ -134,13 +134,13 @@ def train_smartsat(train_files: list[str]) -> tuple:
         gamma=0.99,
         gae_lambda=0.95,
         clip_range=0.2,
-        verbose=1,
+        verbose=0,
         seed=SEED,
         tensorboard_log=os.path.join(OUTPUT_DIR, "tb_logs"),
     )
 
     # Callbacks
-    reward_callback = RewardLoggerCallback(log_interval=1000, verbose=1)
+    reward_callback = RewardLoggerCallback(log_interval=5000, verbose=1)
 
     print(f"[Train] Bắt đầu training...")
     start_time = time.time()
