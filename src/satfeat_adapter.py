@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 from typing import Iterable
 
@@ -17,6 +18,7 @@ FEATURE_CACHE_DIR = os.environ.get("LANGSAT_FEATURE_CACHE_DIR", "").strip()
 SATFEATPY_FULL_LOCAL_SEARCH = os.environ.get("LANGSAT_SATFEATPY_FULL_LOCAL_SEARCH", "0") == "1"
 _BACKEND_NOTICE_PRINTED: set[str] = set()
 BACKEND_USAGE = {"satfeatpy": 0, "fallback": 0, "cache": 0}
+CACHE_VERSION = "satfeat-v2"
 
 
 SATZILLA_FEATURE_ORDER = [
@@ -77,42 +79,40 @@ def extract_sat_features(filepath: str, n_features: int = N_SATZILLA_FEATURES) -
         _notice_once("backend", f"[Features] Unknown LANGSAT_FEATURE_BACKEND={backend!r}; using auto.")
         backend = "auto"
 
-    cache_path = _cache_path(filepath, backend, n_features)
-    if cache_path and cache_path.exists():
-        try:
-            BACKEND_USAGE["cache"] += 1
-            return _normalize(np.array(json.loads(cache_path.read_text()), dtype=np.float32), n_features)
-        except Exception:
-            pass
-
-    arr: np.ndarray
-    if backend in {"auto", "satfeatpy"}:
-        try:
-            arr = _extract_with_satfeatpy(filepath, n_features)
-            BACKEND_USAGE["satfeatpy"] += 1
-            _notice_once("satfeatpy", "[Features] Using SATfeatPy/SATzilla-style global features.")
-        except Exception as exc:
-            if backend == "satfeatpy":
-                raise
-            _notice_once(
-                "fallback",
-                f"[Features] SATfeatPy unavailable or incomplete ({type(exc).__name__}: {exc}); using local fallback features.",
-            )
-            arr = _extract_fallback_features(filepath, n_features)
-            BACKEND_USAGE["fallback"] += 1
-    else:
+    if backend == "fallback":
+        cached = _read_cache(filepath, "fallback", n_features)
+        if cached is not None:
+            return cached
         _notice_once("fallback_forced", "[Features] Using local fallback features.")
-        arr = _extract_fallback_features(filepath, n_features)
+        arr = _normalize(_extract_fallback_features(filepath, n_features), n_features)
         BACKEND_USAGE["fallback"] += 1
+        _write_cache(filepath, "fallback", n_features, arr)
+        return arr
 
-    arr = _normalize(arr, n_features)
-    if cache_path:
-        try:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(json.dumps(arr.astype(float).tolist()))
-        except Exception:
-            pass
-    return arr
+    cached = _read_cache(filepath, "satfeatpy", n_features)
+    if cached is not None:
+        return cached
+
+    try:
+        arr = _normalize(_extract_with_satfeatpy(filepath, n_features), n_features)
+        BACKEND_USAGE["satfeatpy"] += 1
+        _notice_once("satfeatpy", "[Features] Using SATfeatPy/SATzilla-style global features.")
+        _write_cache(filepath, "satfeatpy", n_features, arr)
+        return arr
+    except Exception as exc:
+        if backend == "satfeatpy":
+            raise
+        _notice_once(
+            "fallback",
+            f"[Features] SATfeatPy unavailable or incomplete ({type(exc).__name__}: {exc}); using local fallback features.",
+        )
+        cached = _read_cache(filepath, "fallback", n_features)
+        if cached is not None:
+            return cached
+        arr = _normalize(_extract_fallback_features(filepath, n_features), n_features)
+        BACKEND_USAGE["fallback"] += 1
+        _write_cache(filepath, "fallback", n_features, arr)
+        return arr
 
 
 def _extract_with_satfeatpy(filepath: str, n_features: int) -> np.ndarray:
@@ -129,11 +129,11 @@ def _extract_with_satfeatpy(filepath: str, n_features: int) -> np.ndarray:
 
     from sat_instance.sat_instance import SATInstance as SATFeatInstance
 
-    cnf_path = str(Path(filepath).resolve())
+    normalized_path = _normalized_dimacs_copy(filepath)
     cwd = os.getcwd()
     try:
         os.chdir(satfeat_path)
-        sat = SATFeatInstance(cnf_path, preprocess=False)
+        sat = SATFeatInstance(normalized_path, preprocess=False)
         if getattr(sat, "solved", False):
             return np.zeros(n_features, dtype=np.float32)
 
@@ -147,6 +147,30 @@ def _extract_with_satfeatpy(filepath: str, n_features: int) -> np.ndarray:
         return np.array(values, dtype=np.float32)
     finally:
         os.chdir(cwd)
+        try:
+            os.remove(normalized_path)
+        except Exception:
+            pass
+
+
+def _normalized_dimacs_copy(filepath: str) -> str:
+    """SATfeatPy is strict about whitespace in DIMACS headers."""
+    fd, out_path = tempfile.mkstemp(prefix="langsat_satfeat_", suffix=".cnf")
+    with os.fdopen(fd, "w", encoding="utf-8") as out, open(filepath, encoding="utf-8") as src:
+        for raw in src:
+            line = raw.strip()
+            if not line or line.startswith("%"):
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+            if parts[0] == "c":
+                continue
+            if parts[0] == "p" and len(parts) >= 4:
+                out.write(f"p cnf {int(parts[2])} {int(parts[3])}\n")
+                continue
+            out.write(" ".join(parts) + "\n")
+    return out_path
 
 
 def _extract_fallback_features(filepath: str, n_features: int) -> np.ndarray:
@@ -236,11 +260,45 @@ def _normalize(arr: np.ndarray, n_features: int) -> np.ndarray:
     return arr.astype(np.float32)
 
 
-def _cache_path(filepath: str, backend: str, n_features: int) -> Path | None:
+def _read_cache(filepath: str, source: str, n_features: int) -> np.ndarray | None:
+    cache_path = _cache_path(filepath, source, n_features)
+    if not cache_path or not cache_path.exists():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text())
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("version") != CACHE_VERSION or payload.get("source") != source:
+            return None
+        BACKEND_USAGE["cache"] += 1
+        return _normalize(np.array(payload["features"], dtype=np.float32), n_features)
+    except Exception:
+        return None
+
+
+def _write_cache(filepath: str, source: str, n_features: int, arr: np.ndarray):
+    cache_path = _cache_path(filepath, source, n_features)
+    if not cache_path:
+        return
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": CACHE_VERSION,
+            "source": source,
+            "features": arr.astype(float).tolist(),
+        }
+        cache_path.write_text(json.dumps(payload))
+    except Exception:
+        pass
+
+
+def _cache_path(filepath: str, source: str, n_features: int) -> Path | None:
     if not FEATURE_CACHE_DIR:
         return None
     resolved = str(Path(filepath).resolve())
-    key = hashlib.sha1(f"{resolved}|{backend}|{n_features}|{SATFEATPY_FULL_LOCAL_SEARCH}".encode()).hexdigest()
+    key = hashlib.sha1(
+        f"{CACHE_VERSION}|{resolved}|{source}|{n_features}|{SATFEATPY_FULL_LOCAL_SEARCH}".encode()
+    ).hexdigest()
     return Path(FEATURE_CACHE_DIR) / f"{key}.json"
 
 
