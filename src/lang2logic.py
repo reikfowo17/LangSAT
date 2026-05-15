@@ -88,6 +88,11 @@ Input: "Not A and B"
 Output:
 And(Not(A), B)
 A="A", B="B"
+
+Input: "The circus does not have a carousel if and only if it has a ferris wheel."
+Output:
+Equivalent(Not(C), F)
+C="The circus has a carousel", F="The circus has a ferris wheel"
 """
 
     def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4o-mini"):
