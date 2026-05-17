@@ -196,18 +196,27 @@ A="A", B="B"
             expr_str = re.sub(rf"\b{re.escape(old)}\b", new, expr_str)
         return expr_str
 
+    def _is_reasoning_model(self) -> bool:
+        """o1-*, o3-*, o4-* does not support temp and max_tokens"""
+        import re as _re
+        return bool(_re.match(r"o[1-9]", self.model))
+
     def nl_to_logical(self, sentence: str) -> str:
         client = self._get_client()
         var_context = self._mapping_context()
         try:
+            if self._is_reasoning_model():
+                api_params = dict(max_completion_tokens=5000)  # reasoning tokens + output; 200 is too small for o4-mini
+            else:
+                api_params = dict(temperature=0, max_tokens=200)
+
             response = client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {"role": "system", "content": self.SYSTEM_PROMPT + var_context},
                     {"role": "user", "content": f'Sentence: "{sentence}"'},
                 ],
-                temperature=0,       # deterministic output
-                max_tokens=200,
+                **api_params,
             )
             raw = response.choices[0].message.content.strip()
             # Track token usage
