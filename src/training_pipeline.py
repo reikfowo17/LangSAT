@@ -37,11 +37,19 @@ LEARNING_RATE  = 0.0002
 TOTAL_STEPS    = int(os.environ.get("LANGSAT_TOTAL_STEPS", "100000"))  # 1 epoch theo bài báo
 TRAIN_RATIO    = 0.8              # 800 train / 200 test
 SEED           = 42
+SPLIT_SEED     = int(os.environ.get("LANGSAT_SPLIT_SEED", str(SEED)))
 CHECKPOINT_FREQ = 10_000          # Lưu checkpoint mỗi 10k steps
 TRAIN_LOG_INTERVAL = int(os.environ.get("LANGSAT_TRAIN_LOG_INTERVAL", "5000"))
 TRAIN_HEARTBEAT_SECONDS = float(os.environ.get("LANGSAT_TRAIN_HEARTBEAT_SECONDS", "60"))
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def split_strategy() -> str:
+    strategy = os.environ.get("LANGSAT_SPLIT_STRATEGY", "sorted").strip().lower()
+    if strategy not in {"sorted", "shuffled"}:
+        raise ValueError("LANGSAT_SPLIT_STRATEGY must be 'sorted' or 'shuffled'")
+    return strategy
 
 
 def set_reproducible_seeds(seed: int = SEED):
@@ -72,15 +80,31 @@ def load_and_split_dataset(data_dir: str, train_ratio: float = 0.8):
             f"và upload lên Kaggle dưới dạng dataset."
         )
 
+    strategy = split_strategy()
+    if strategy == "shuffled":
+        rng = np.random.default_rng(SPLIT_SEED)
+        files = list(rng.permutation(files))
+
     n_train = int(len(files) * train_ratio)
     train_files = files[:n_train]
     test_files  = files[n_train:]
 
     print(f"[Dataset] Tổng: {len(files)} files")
     print(f"[Dataset] Train: {len(train_files)} | Test: {len(test_files)}")
+    print(f"[Dataset] Split: {strategy} | Seed: {SPLIT_SEED if strategy == 'shuffled' else 'n/a'}")
 
     # Lưu split list
-    split_info = {"train": train_files, "test": test_files}
+    split_info = {
+        "train": train_files,
+        "test": test_files,
+        "metadata": {
+            "run_profile": "paper_like",
+            "train_ratio": train_ratio,
+            "split_strategy": strategy,
+            "split_seed": SPLIT_SEED if strategy == "shuffled" else None,
+            "n_files": len(files),
+        },
+    }
     with open(os.path.join(OUTPUT_DIR, "data_split.json"), "w") as f:
         json.dump(split_info, f, indent=2)
 
@@ -149,6 +173,7 @@ def train_smartsat(train_files: list[str]) -> tuple:
     print(f"  Learning rate : {LEARNING_RATE}")
     print(f"  Total steps   : {TOTAL_STEPS:,}")
     print(f"  Train files   : {len(train_files)}")
+    print("  Run profile   : paper_like")
     print()
 
     def make_env():

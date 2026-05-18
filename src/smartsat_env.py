@@ -204,6 +204,7 @@ class SmartSATEnv(gym.Env):
         solver.current_level += 1
         solver.trail_lim.append(len(solver.trail))
         solver._enqueue(var, value, solver.current_level, reason=None)
+        solver.stats.decisions += 1
 
         # BCP
         conflict_ci = solver.unit_propagate()

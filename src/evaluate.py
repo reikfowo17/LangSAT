@@ -45,6 +45,23 @@ SMARTSAT_USE_SEARCH_TIME = os.environ.get("LANGSAT_USE_SEARCH_TIME", "0") == "1"
 BASELINE_USE_PYSAT = os.environ.get("LANGSAT_BASELINE_USE_PYSAT", os.environ.get("LANGSAT_USE_PYSAT", "1")) == "1"
 SMARTSAT_USE_PYSAT = os.environ.get("LANGSAT_SMARTSAT_USE_PYSAT", os.environ.get("LANGSAT_USE_PYSAT", "1")) == "1"
 PAPERLIKE_PYSAT_TIME_MODE = os.environ.get("LANGSAT_PYSAT_TIME_MODE", PYSAT_TIME_MODE).lower()
+RUN_PROFILE = "paper_like"
+REQUIRE_SATFEATPY = os.environ.get("LANGSAT_REQUIRE_SATFEATPY", "1") == "1"
+
+
+def _metric_basis() -> str:
+    if SMARTSAT_USE_SEARCH_TIME:
+        return "search_time_without_policy_overhead"
+    if REPORT_SCALE_TO_PAPER or TIME_SCALE != 1.0:
+        return "scaled_total_time"
+    return "raw_total_time"
+
+
+def _validate_run_config():
+    if SMARTSAT_USE_SEARCH_TIME:
+        raise ValueError("paper-like reproduce must use total solving time; set LANGSAT_USE_SEARCH_TIME=0")
+    if os.environ.get("LANGSAT_REWARD_MODE", "paper").lower() != "paper":
+        raise ValueError("paper-like reproduce requires LANGSAT_REWARD_MODE=paper")
 
 
 def _time_scale(df: pd.DataFrame) -> float:
@@ -161,10 +178,13 @@ def solve_baseline_with_stats(filepath: str) -> tuple[bool, float, dict]:
 
 
 def evaluate(test_files: list[str], model: PPO) -> pd.DataFrame:
+    _validate_run_config()
     results = []
     n = len(test_files)
 
     print(f" EVALUATION — {n} instances")
+    print(f"  Run profile : {RUN_PROFILE}")
+    print(f"  Metric basis: {_metric_basis()}")
 
     for i, filepath in enumerate(test_files):
         # 1. CDCL Baseline
@@ -217,6 +237,8 @@ def evaluate(test_files: list[str], model: PPO) -> pd.DataFrame:
         df["baseline_time"] = df["baseline_search_time"]
         df["smartsat_time"] = df["smartsat_search_time"]
     df["time_scale"] = scale
+    df["run_profile"] = RUN_PROFILE
+    df["metric_basis"] = _metric_basis()
     csv_path = os.path.join(OUTPUT_DIR, "eval_results.csv")
     df.to_csv(csv_path, index=False)
     print(f"\n[Eval] Results saved → {csv_path}")
@@ -235,6 +257,8 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     conflict_ratio = _median_ratio(df["smartsat_conflicts"], df["baseline_conflicts"])
 
     metrics = {
+        "run_profile"       : RUN_PROFILE,
+        "metric_basis"      : _metric_basis(),
         "n_instances"      : n,
         "smartsat_wins"    : int(smartsat_wins),
         "baseline_wins"    : int(baseline_wins),
@@ -257,6 +281,7 @@ def compute_metrics(df: pd.DataFrame) -> dict:
         "smartsat_use_pysat": SMARTSAT_USE_PYSAT,
         "pysat_time_mode"   : PAPERLIKE_PYSAT_TIME_MODE,
         "feature_backend"   : FEATURE_BACKEND,
+        "require_satfeatpy" : REQUIRE_SATFEATPY,
         "feature_backend_usage": dict(BACKEND_USAGE),
         "satfeatpy_dir"     : SATFEATPY_DIR,
         "satfeatpy_full_local_search": SATFEATPY_FULL_LOCAL_SEARCH,
@@ -278,10 +303,21 @@ def compute_metrics(df: pd.DataFrame) -> dict:
         "smartsat_budget_exits": int(df["smartsat_budget_exceeded"].sum()),
         "baseline_pysat_fallbacks": int((df["baseline_engine"] == "pysat_minisat22").sum()),
         "smartsat_pysat_fallbacks": int((df["smartsat_engine"] == "pysat_minisat22").sum()),
+        "observation_encoding": "flat_vector_with_signed_clause_variable_matrix",
+        "graph_policy": False,
     }
+
+    split_meta = _load_split_metadata()
+    if split_meta:
+        metrics["split_metadata"] = split_meta
+
+    if REQUIRE_SATFEATPY and BACKEND_USAGE.get("fallback", 0) > 0:
+        raise RuntimeError("SATfeatPy is required for this run, but fallback features were used.")
 
     # In bảng kết quả
     print("  KẾT QUẢ EVALUATION")
+    print(f"  Run profile          : {metrics['run_profile']}")
+    print(f"  Metric basis         : {metrics['metric_basis']}")
     print(f"  Số instances test    : {metrics['n_instances']}")
     print(f"  SmartSAT thắng       : {metrics['smartsat_wins']} ({metrics['win_rate_pct']}%)")
     print(f"  Baseline thắng       : {metrics['baseline_wins']}")
@@ -290,7 +326,9 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     print(f"  Median Baseline      : {metrics['median_baseline']}s")
     print(f"  Policy mode          : {metrics['policy_mode']}")
     print(f"  Feature backend      : {metrics['feature_backend']}")
+    print(f"  Require SATfeatPy    : {metrics['require_satfeatpy']}")
     print(f"  Feature usage        : {metrics['feature_backend_usage']}")
+    print(f"  Observation encoding : {metrics['observation_encoding']}")
     print(f"  Search-time metric   : {metrics['use_search_time']}")
     print(f"  PySAT time mode      : {metrics['pysat_time_mode']}")
     print(f"  Baseline budget exits: {metrics['baseline_budget_exits']}")
@@ -321,7 +359,46 @@ def compute_metrics(df: pd.DataFrame) -> dict:
         json.dump(metrics, f, indent=2)
     print(f"\n  Metrics saved → {OUTPUT_DIR}/metrics.json")
 
+    _write_summary(metrics)
+
     return metrics
+
+
+def _load_split_metadata() -> dict:
+    if not os.path.exists(SPLIT_PATH):
+        return {}
+    try:
+        with open(SPLIT_PATH) as f:
+            split = json.load(f)
+        return split.get("metadata", {})
+    except Exception:
+        return {}
+
+
+def _write_summary(metrics: dict):
+    lines = [
+        f"Run profile: {metrics['run_profile']}",
+        f"Metric basis: {metrics['metric_basis']}",
+        f"Instances: {metrics['n_instances']}",
+        f"SmartSAT wins: {metrics['smartsat_wins']} ({metrics['win_rate_pct']}%)",
+        f"Baseline wins: {metrics['baseline_wins']}",
+        f"Ties: {metrics['ties']}",
+        f"Median SmartSAT: {metrics['median_smartsat']}s",
+        f"Median Baseline: {metrics['median_baseline']}s",
+        f"Raw median SmartSAT: {metrics['median_smartsat_raw']}s",
+        f"Raw median Baseline: {metrics['median_baseline_raw']}s",
+        f"Feature backend: {metrics['feature_backend']}",
+        f"Feature usage: {metrics['feature_backend_usage']}",
+        f"SATfeatPy local search: {metrics['satfeatpy_full_local_search']}",
+        f"Observation encoding: {metrics['observation_encoding']}",
+        f"Graph policy: {metrics['graph_policy']}",
+        f"Decision ratio ST/BSL: {metrics['median_decision_ratio_st_over_bsl']}x",
+        f"Conflict ratio ST/BSL: {metrics['median_conflict_ratio_st_over_bsl']}x",
+    ]
+    path = os.path.join(OUTPUT_DIR, "summary.txt")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"  Summary saved → {path}")
 
 
 def _safe_div(numerator: float, denominator: float) -> float:

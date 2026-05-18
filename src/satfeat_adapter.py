@@ -16,6 +16,7 @@ SATFEATPY_DIR = os.environ.get("LANGSAT_SATFEATPY_DIR", "").strip()
 FEATURE_BACKEND = os.environ.get("LANGSAT_FEATURE_BACKEND", "auto").lower()
 FEATURE_CACHE_DIR = os.environ.get("LANGSAT_FEATURE_CACHE_DIR", "").strip()
 SATFEATPY_FULL_LOCAL_SEARCH = os.environ.get("LANGSAT_SATFEATPY_FULL_LOCAL_SEARCH", "0") == "1"
+REQUIRE_SATFEATPY = os.environ.get("LANGSAT_REQUIRE_SATFEATPY", "1") == "1"
 _BACKEND_NOTICE_PRINTED: set[str] = set()
 BACKEND_USAGE = {"satfeatpy": 0, "fallback": 0, "cache": 0}
 CACHE_VERSION = "satfeat-v2"
@@ -80,6 +81,8 @@ def extract_sat_features(filepath: str, n_features: int = N_SATZILLA_FEATURES) -
         backend = "auto"
 
     if backend == "fallback":
+        if REQUIRE_SATFEATPY:
+            raise RuntimeError("SATfeatPy is required for this run; fallback feature backend is disabled.")
         cached = _read_cache(filepath, "fallback", n_features)
         if cached is not None:
             return cached
@@ -100,7 +103,7 @@ def extract_sat_features(filepath: str, n_features: int = N_SATZILLA_FEATURES) -
         _write_cache(filepath, "satfeatpy", n_features, arr)
         return arr
     except Exception as exc:
-        if backend == "satfeatpy":
+        if backend == "satfeatpy" or REQUIRE_SATFEATPY:
             raise
         _notice_once(
             "fallback",
