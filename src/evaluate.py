@@ -11,14 +11,13 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from stable_baselines3 import PPO
 from cdcl_baseline import CDCLSolver, SATInstance
-from competitive_advisor import CompetitiveBranchingAdvisor
 from satfeat_adapter import (
     BACKEND_USAGE,
     SATFEATPY_DIR,
     SATFEATPY_FULL_LOCAL_SEARCH,
     extract_sat_features,
 )
-from smartsat_env import N_GLOBAL, N_VARS, build_solver_observation, validate_uf20_91_instance
+from smartsat_env import N_VARS, build_solver_observation, validate_uf20_91_instance
 
 try:
     from sb3_contrib import MaskablePPO
@@ -38,11 +37,10 @@ SPLIT_PATH = os.environ.get("LANGSAT_SPLIT_PATH", os.path.join(OUTPUT_DIR, "data
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 PAPER_MEDIAN_SECONDS = 1.02
-SMARTSAT_POLICY_MODE = os.environ.get("LANGSAT_POLICY_MODE", "competitive").lower()
+SMARTSAT_POLICY_MODE = os.environ.get("LANGSAT_POLICY_MODE", "rl").lower()
 SMARTSAT_USE_SEARCH_TIME = os.environ.get("LANGSAT_USE_SEARCH_TIME", "0") == "1"
-RUN_PROFILE = "competitive" if SMARTSAT_POLICY_MODE == "competitive" else "paper_like"
+RUN_PROFILE = "paper_like"
 GRAPH_POLICY_ENABLED = True
-COMPETITIVE_ENABLE_RL = os.environ.get("LANGSAT_COMPETITIVE_ENABLE_RL", "0") == "1"
 
 
 def _metric_basis() -> str:
@@ -54,16 +52,6 @@ def _metric_basis() -> str:
 def _validate_run_config():
     if SMARTSAT_USE_SEARCH_TIME:
         raise ValueError("paper-like reproduce must use total solving time; set LANGSAT_USE_SEARCH_TIME=0")
-
-
-def model_required_for_policy() -> bool:
-    return SMARTSAT_POLICY_MODE != "competitive" or COMPETITIVE_ENABLE_RL
-
-
-def feature_backend_name() -> str:
-    if SMARTSAT_POLICY_MODE == "competitive" and not COMPETITIVE_ENABLE_RL:
-        return "none_static_advisor"
-    return "satfeatpy"
 
 
 def _predict_action(model, obs, action_masks=None):
@@ -80,34 +68,17 @@ def _predict_action(model, obs, action_masks=None):
     return action
 
 
-def solve_with_smartsat(filepath: str, model: PPO | None) -> tuple[bool, float, dict]:
+def solve_with_smartsat(filepath: str, model: PPO) -> tuple[bool, float, dict]:
     inst = SATInstance.from_dimacs(filepath)
     validate_uf20_91_instance(inst, filepath)
     solver = CDCLSolver(inst)
-    if SMARTSAT_POLICY_MODE == "competitive" and not COMPETITIVE_ENABLE_RL:
-        global_features = np.zeros(N_GLOBAL, dtype=np.float32)
-    else:
-        global_features = extract_sat_features(filepath)
+    global_features = extract_sat_features(filepath)
     policy_time = 0.0
     rl_decisions = 0
     invalid_decisions = 0
-    advisor = None
-    if SMARTSAT_POLICY_MODE == "competitive":
-        advisor = CompetitiveBranchingAdvisor(
-            inst,
-            rl_model=model,
-            global_features=global_features,
-            enable_rl=COMPETITIVE_ENABLE_RL,
-        )
 
     def policy(current_solver: CDCLSolver):
         nonlocal policy_time, rl_decisions, invalid_decisions
-        if advisor is not None:
-            decision = advisor.decide(current_solver)
-            if decision is not None:
-                return decision
-            return current_solver.pick_branching_variable()
-
         baseline_pick = current_solver.pick_branching_variable()
         if baseline_pick is None:
             return None
@@ -145,11 +116,6 @@ def solve_with_smartsat(filepath: str, model: PPO | None) -> tuple[bool, float, 
         )
 
     sat, elapsed = solver.solve(decision_policy=policy)
-    advisor_stats = dict(advisor.stats) if advisor is not None else {}
-    if advisor_stats:
-        policy_time += float(advisor_stats.get("rl_time_raw", 0.0))
-        rl_decisions += int(advisor_stats.get("rl", 0))
-        invalid_decisions += int(advisor_stats.get("rl_invalid", 0))
     search_elapsed = max(elapsed - policy_time, 0.0)
     return sat, elapsed, {
         "search_time_raw": search_elapsed,
@@ -166,10 +132,6 @@ def solve_with_smartsat(filepath: str, model: PPO | None) -> tuple[bool, float, 
         "invalid_decisions": invalid_decisions,
         "invalid_action_rate": _safe_div(invalid_decisions, solver.stats.policy_calls),
         "policy_time_per_call_raw": _safe_div(policy_time, solver.stats.policy_calls),
-        "advisor_static_decisions": int(advisor_stats.get("static", 0)),
-        "advisor_baseline_decisions": int(advisor_stats.get("baseline", 0)),
-        "advisor_rl_decisions": int(advisor_stats.get("rl", 0)),
-        "advisor_rl_invalid": int(advisor_stats.get("rl_invalid", 0)),
     }
 
 
@@ -234,10 +196,6 @@ def evaluate(test_files: list[str], model: PPO) -> pd.DataFrame:
             "smartsat_invalid_decisions": smartsat_stats["invalid_decisions"],
             "smartsat_invalid_action_rate": smartsat_stats["invalid_action_rate"],
             "smartsat_policy_time_per_call_raw": smartsat_stats["policy_time_per_call_raw"],
-            "smartsat_advisor_static_decisions": smartsat_stats["advisor_static_decisions"],
-            "smartsat_advisor_baseline_decisions": smartsat_stats["advisor_baseline_decisions"],
-            "smartsat_advisor_rl_decisions": smartsat_stats["advisor_rl_decisions"],
-            "smartsat_advisor_rl_invalid": smartsat_stats["advisor_rl_invalid"],
         })
 
         if (i + 1) % 20 == 0 or i == 0:
@@ -290,7 +248,7 @@ def compute_metrics(df: pd.DataFrame) -> dict:
         "median_policy_time_per_call_raw": round(float(df["smartsat_policy_time_per_call_raw"].median()), 8),
         "policy_mode"       : SMARTSAT_POLICY_MODE,
         "use_search_time"   : SMARTSAT_USE_SEARCH_TIME,
-        "feature_backend"   : feature_backend_name(),
+        "feature_backend"   : "satfeatpy",
         "feature_backend_usage": dict(BACKEND_USAGE),
         "satfeatpy_dir"     : SATFEATPY_DIR,
         "satfeatpy_full_local_search": SATFEATPY_FULL_LOCAL_SEARCH,
@@ -304,9 +262,6 @@ def compute_metrics(df: pd.DataFrame) -> dict:
         "median_invalid_decisions": round(float(df["smartsat_invalid_decisions"].median()), 2),
         "median_policy_calls": round(float(df["smartsat_policy_calls"].median()), 2),
         "median_invalid_action_rate_pct": round(float(df["smartsat_invalid_action_rate"].median()) * 100, 2),
-        "median_advisor_static_decisions": round(float(df["smartsat_advisor_static_decisions"].median()), 2),
-        "median_advisor_baseline_decisions": round(float(df["smartsat_advisor_baseline_decisions"].median()), 2),
-        "median_advisor_rl_decisions": round(float(df["smartsat_advisor_rl_decisions"].median()), 2),
         "median_decision_ratio_st_over_bsl": round(decision_ratio, 4),
         "median_conflict_ratio_st_over_bsl": round(conflict_ratio, 4),
         "baseline_budget_exit_rate_pct": round(float(df["baseline_budget_exceeded"].mean()) * 100, 2),
@@ -341,15 +296,11 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     print(f"  Median decisions ST  : {metrics['median_decisions_smartsat']}")
     print(f"  Median decisions BSL : {metrics['median_decisions_baseline']}")
     print(f"  Median policy calls  : {metrics['median_policy_calls']}")
-    print(f"  Advisor static route : {metrics['median_advisor_static_decisions']}")
-    print(f"  Advisor baseline rt. : {metrics['median_advisor_baseline_decisions']}")
-    print(f"  Advisor RL route     : {metrics['median_advisor_rl_decisions']}")
     print(f"  Invalid action rate  : {metrics['median_invalid_action_rate_pct']}%")
     print(f"  Policy time / call   : {metrics['median_policy_time_per_call_raw']}s")
     print(f"  Decision ratio ST/BSL: {metrics['median_decision_ratio_st_over_bsl']}x")
     print(f"  Conflict ratio ST/BSL: {metrics['median_conflict_ratio_st_over_bsl']}x")
-    if RUN_PROFILE == "paper_like":
-        print(f"  [Bài báo gốc]        : ~53% win rate, ~1.02s median")
+    print(f"  [Bài báo gốc]        : ~53% win rate, ~1.02s median")
     print("="*55)
 
     # So sánh với bài báo
@@ -357,10 +308,9 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     print(f"  Raw Median Baseline  : {metrics['median_baseline_raw']}s")
     print(f"  Raw Search SmartSAT  : {metrics['median_smartsat_search_raw']}s")
     print(f"  Raw Policy Overhead  : {metrics['median_policy_time_raw']}s")
-    if RUN_PROFILE == "paper_like":
-        print(f"\n  Sai lệch win rate   : {abs(metrics['win_rate_pct'] - 53.0):.2f}%")
-        print(f"  Sai lệch median ST  : {abs(metrics['median_smartsat'] - PAPER_MEDIAN_SECONDS):.4f}s")
-        print(f"  Sai lệch median BSL : {abs(metrics['median_baseline'] - PAPER_MEDIAN_SECONDS):.4f}s")
+    print(f"\n  Sai lệch win rate   : {abs(metrics['win_rate_pct'] - 53.0):.2f}%")
+    print(f"  Sai lệch median ST  : {abs(metrics['median_smartsat'] - PAPER_MEDIAN_SECONDS):.4f}s")
+    print(f"  Sai lệch median BSL : {abs(metrics['median_baseline'] - PAPER_MEDIAN_SECONDS):.4f}s")
 
     # Lưu metrics
     with open(os.path.join(OUTPUT_DIR, "metrics.json"), "w") as f:
@@ -400,9 +350,6 @@ def _write_summary(metrics: dict):
         f"SATfeatPy local search: {metrics['satfeatpy_full_local_search']}",
         f"Observation encoding: {metrics['observation_encoding']}",
         f"Graph policy: {metrics['graph_policy']}",
-        f"Advisor static route median: {metrics['median_advisor_static_decisions']}",
-        f"Advisor baseline route median: {metrics['median_advisor_baseline_decisions']}",
-        f"Advisor RL route median: {metrics['median_advisor_rl_decisions']}",
         f"Decision ratio ST/BSL: {metrics['median_decision_ratio_st_over_bsl']}x",
         f"Conflict ratio ST/BSL: {metrics['median_conflict_ratio_st_over_bsl']}x",
     ]
@@ -494,25 +441,22 @@ if __name__ == "__main__":
             "Chưa có data_split.json. Hãy chạy training_pipeline.py trước."
         )
 
-    # 2. Load model when the selected policy needs one.
-    model = None
-    if model_required_for_policy() and not os.path.exists(MODEL_PATH + ".zip"):
+    # 2. Load model
+    if not os.path.exists(MODEL_PATH + ".zip"):
         raise FileNotFoundError(
             f"Model không tìm thấy tại {MODEL_PATH}.zip\n"
             "Hãy chạy training_pipeline.py trước."
         )
-    if model_required_for_policy() and MaskablePPO is not None:
+    if MaskablePPO is not None:
         try:
             model = MaskablePPO.load(MODEL_PATH)
             print(f"[Eval] MaskablePPO model loaded từ {MODEL_PATH}.zip")
         except Exception:
             model = PPO.load(MODEL_PATH)
             print(f"[Eval] PPO model loaded từ {MODEL_PATH}.zip")
-    elif model_required_for_policy():
+    else:
         model = PPO.load(MODEL_PATH)
         print(f"[Eval] PPO model loaded từ {MODEL_PATH}.zip")
-    else:
-        print("[Eval] Competitive static advisor selected; PPO model is not required.")
 
     # 3. Evaluate
     df = evaluate(test_files, model)
