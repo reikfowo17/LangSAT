@@ -11,7 +11,7 @@ import numpy as np
 N_SATZILLA_FEATURES = 48
 SATFEATPY_DIR = os.environ.get("LANGSAT_SATFEATPY_DIR", "").strip()
 FEATURE_CACHE_DIR = os.environ.get("LANGSAT_FEATURE_CACHE_DIR", "").strip()
-SATFEATPY_FULL_LOCAL_SEARCH = os.environ.get("LANGSAT_SATFEATPY_FULL_LOCAL_SEARCH", "0") == "1"
+SATFEATPY_FULL_LOCAL_SEARCH = os.environ.get("LANGSAT_SATFEATPY_FULL_LOCAL_SEARCH", "1") == "1"
 _BACKEND_NOTICE_PRINTED: set[str] = set()
 BACKEND_USAGE = {"satfeatpy": 0, "cache": 0}
 CACHE_VERSION = "satfeat-v2"
@@ -67,6 +67,7 @@ SATZILLA_FEATURE_ORDER = [
     "saps_FirstLocalMinRatio_Mean",
     "saps_EstACL_Mean",
 ]
+LOCAL_SEARCH_FEATURES = SATZILLA_FEATURE_ORDER[41:]
 
 
 def extract_sat_features(filepath: str, n_features: int = N_SATZILLA_FEATURES) -> np.ndarray:
@@ -107,9 +108,25 @@ def _extract_with_satfeatpy(filepath: str, n_features: int) -> np.ndarray:
         sat.gen_basic_features()
         sat.gen_dpll_probing_features()
         if SATFEATPY_FULL_LOCAL_SEARCH:
-            sat.gen_local_search_probing_features()
+            try:
+                sat.gen_local_search_probing_features()
+            except Exception as exc:
+                raise RuntimeError(
+                    "SATfeatPy full local-search probing failed. Strict paper "
+                    "reproduction needs the SATzilla local-search features "
+                    f"{LOCAL_SEARCH_FEATURES}; install/configure ubcsat or set "
+                    "LANGSAT_SATFEATPY_FULL_LOCAL_SEARCH=0 for a partial-feature "
+                    "diagnostic run."
+                ) from exc
 
         features = sat.features_dict
+        if SATFEATPY_FULL_LOCAL_SEARCH:
+            missing = [name for name in SATZILLA_FEATURE_ORDER if name not in features]
+            if missing:
+                raise RuntimeError(
+                    "SATfeatPy did not return the full 48 SATzilla feature set. "
+                    f"Missing: {missing}"
+                )
         values = [_safe_feature_value(features.get(name, 0.0)) for name in SATZILLA_FEATURE_ORDER]
         return np.array(values, dtype=np.float32)
     finally:

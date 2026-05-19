@@ -11,21 +11,24 @@ from cdcl_baseline import SATInstance, CDCLSolver
 from satfeat_adapter import extract_sat_features
 
 
-_BASELINE_DECISION_CACHE: dict[str, int] = {}
-
-
 N_VARS    = 20
 N_CLAUSES = 91
 N_GLOBAL  = 48
-REWARD_MODE = os.environ.get("LANGSAT_REWARD_MODE", "paper").lower()
-STEP_PENALTY = float(os.environ.get("LANGSAT_STEP_PENALTY", "0.0"))
-CONFLICT_PENALTY = float(os.environ.get("LANGSAT_CONFLICT_PENALTY", "0.0"))
-TRUNCATION_PENALTY = float(os.environ.get("LANGSAT_TRUNCATION_PENALTY", "5.0"))
 MAX_STEPS = int(os.environ.get("LANGSAT_ENV_MAX_STEPS", str(N_VARS * 10)))
 
 OBS_SIZE = N_VARS + N_CLAUSES + N_VARS * N_CLAUSES + N_GLOBAL
 # 20 + 91 + 1820 + 48 = 1979
 INVALID_ACTION_PENALTY = float(os.environ.get("LANGSAT_INVALID_ACTION_PENALTY", "2.0"))
+
+
+def validate_uf20_91_instance(inst: SATInstance, filepath: str = ""):
+    if inst.n_vars != N_VARS or inst.n_clauses != N_CLAUSES:
+        location = f" for {filepath}" if filepath else ""
+        raise ValueError(
+            "SmartSAT paper reproduction is fixed to uf20-91 "
+            f"({N_VARS} variables, {N_CLAUSES} clauses); got "
+            f"{inst.n_vars} variables and {inst.n_clauses} clauses{location}."
+        )
 
 
 def build_solver_observation(
@@ -93,20 +96,18 @@ class SmartSATEnv(gym.Env):
         self._max_steps = MAX_STEPS
         self._global_features = np.zeros(N_GLOBAL, dtype=np.float32)
         self.preferred_literals: list[int] = []
-        self._baseline_decisions = N_VARS
         self._invalid_actions = 0
         self._last_action_mask = np.ones(N_VARS * 2, dtype=np.int8)
+        self._last_clause_score = 0.0
 
     # ---- Helpers ----
 
     def _load_instance(self, filepath: str):
         self._filepath = filepath
         inst = SATInstance.from_dimacs(filepath)
+        validate_uf20_91_instance(inst, filepath)
         self._solver = CDCLSolver(inst)
         self._global_features = extract_sat_features(filepath, N_GLOBAL)
-        self._baseline_decisions = (
-            baseline_decisions(filepath) if REWARD_MODE == "shaped" else N_VARS
-        )
 
     def _get_obs(self) -> np.ndarray:
         return build_solver_observation(self._solver, self._global_features)
@@ -125,7 +126,7 @@ class SmartSATEnv(gym.Env):
     def action_masks(self) -> np.ndarray:
         return self._last_action_mask.copy()
 
-    def _compute_reward(self) -> float:
+    def _clause_score(self) -> float:
         satisfied = 0
         unsatisfied = 0
         for clause in self._solver.clauses[:N_CLAUSES]:
@@ -134,18 +135,16 @@ class SmartSATEnv(gym.Env):
                 satisfied += 1
             elif all(v == -1 for v in vals):
                 unsatisfied += 1
-        if REWARD_MODE == "paper":
-            return float(satisfied - unsatisfied)
-        return (satisfied / N_CLAUSES) - float(unsatisfied)
+        return float(satisfied - unsatisfied)
+
+    def _compute_reward(self) -> float:
+        score = self._clause_score()
+        reward = score - self._last_clause_score
+        self._last_clause_score = score
+        return reward
 
     def _terminal_reward(self, sat: bool) -> float:
-        if REWARD_MODE == "paper":
-            return self._compute_reward() if sat else -float(N_CLAUSES + self._step_count)
-        if not sat:
-            return -20.0 - self._step_count
-        baseline = max(self._baseline_decisions, 1)
-        decision_delta = baseline - self._solver.stats.decisions
-        return 20.0 + (2.0 * decision_delta) - (0.5 * self._solver.stats.conflicts)
+        return self._compute_reward() if sat else -float(N_CLAUSES)
 
     # ---- Gym Interface ----
 
@@ -163,6 +162,7 @@ class SmartSATEnv(gym.Env):
 
         # Unit propagation ban đầu (level 0)
         self._solver._find_initial_units()
+        self._last_clause_score = self._clause_score()
         self._last_action_mask = self._compute_action_mask()
 
         obs = self._get_obs()
@@ -183,7 +183,7 @@ class SmartSATEnv(gym.Env):
         if invalid_action:
             self._invalid_actions += 1
             self._done = True
-            reward = -float(N_CLAUSES + self._step_count) - INVALID_ACTION_PENALTY
+            reward = -float(N_CLAUSES) - INVALID_ACTION_PENALTY
             return self._get_obs(), reward, True, False, self._info(invalid_action=True)
 
         lit = var if value == 1 else -var
@@ -191,10 +191,7 @@ class SmartSATEnv(gym.Env):
             self.preferred_literals.append(lit)
 
         # Apply assignment
-        solver.current_level += 1
-        solver.trail_lim.append(len(solver.trail))
-        solver._enqueue(var, value, solver.current_level, reason=None)
-        solver.stats.decisions += 1
+        solver.make_decision(var, value)
 
         # BCP
         conflict_ci = solver.unit_propagate()
@@ -207,22 +204,14 @@ class SmartSATEnv(gym.Env):
                 self._done = True
                 return self._get_obs(), self._terminal_reward(False), True, False, self._info(sat=False)
 
-            learned, btlevel = solver.analyze_conflict(conflict_ci)
-            solver.backtrack(btlevel)
-            ci_new = len(solver.clauses)
-            solver.clauses.append(learned)
+            learned, _ = solver.learn_from_conflict(conflict_ci)
 
             # Force unit nếu learned clause đơn
             if len(learned) == 1:
-                unit_lit = learned[0]
-                v2 = abs(unit_lit)
-                val2 = 1 if unit_lit > 0 else -1
-                if solver.assignment[v2] == 0:
-                    solver._enqueue(v2, val2, solver.current_level, ci_new)
-                    conflict_ci2 = solver.unit_propagate()
-                    if conflict_ci2 is not None:
-                        self._done = True
-                        return self._get_obs(), self._terminal_reward(False), True, False, self._info(sat=False)
+                conflict_ci2 = solver.unit_propagate()
+                if conflict_ci2 is not None:
+                    self._done = True
+                    return self._get_obs(), self._terminal_reward(False), True, False, self._info(sat=False)
 
         # Kiểm tra SAT
         sat = self._check_sat()
@@ -230,11 +219,11 @@ class SmartSATEnv(gym.Env):
             self._done = True
             return self._get_obs(), self._terminal_reward(True), True, False, self._info(sat=True)
 
-        reward = self._compute_reward() - STEP_PENALTY - (CONFLICT_PENALTY if conflict_ci is not None else 0.0)
+        reward = self._compute_reward()
 
         # Truncation: episode quá dài → dừng lại
         if self._step_count >= self._max_steps:
-            return self._get_obs(), reward - TRUNCATION_PENALTY, False, True, self._info(truncated=True)
+            return self._get_obs(), reward, False, True, self._info(truncated=True)
 
         self._last_action_mask = self._compute_action_mask()
         return self._get_obs(), reward, False, False, {}
@@ -271,15 +260,3 @@ class SmartSATEnv(gym.Env):
 
     def close(self):
         pass
-
-
-def baseline_decisions(filepath: str) -> int:
-    cached = _BASELINE_DECISION_CACHE.get(filepath)
-    if cached is not None:
-        return cached
-    inst = SATInstance.from_dimacs(filepath)
-    solver = CDCLSolver(inst)
-    solver.solve()
-    decisions = max(solver.stats.decisions, 1)
-    _BASELINE_DECISION_CACHE[filepath] = decisions
-    return decisions

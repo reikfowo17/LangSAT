@@ -80,12 +80,12 @@ Phần benchmark SmartSAT trên `uf20-91` vẫn là thực nghiệm riêng để
 - Split dataset mặc định là `sorted` để giữ tương thích notebook cũ. Có thể đặt `LANGSAT_SPLIT_STRATEGY=shuffled` và `LANGSAT_SPLIT_SEED=42`; metadata được lưu vào `data_split.json`.
 - SmartSAT dùng 48 global SAT features từ SATfeatPy/SATzilla. Cần clone SATfeatPy và set `LANGSAT_SATFEATPY_DIR`; nếu thiếu hoặc lỗi, training/evaluation sẽ dừng.
 - SmartSAT policy mặc định dùng `SmartSATGraphExtractor` trong `src/policy.py`: PyTorch bipartite message passing trên signed clause-variable graph, fuse với assignment state, clause state và 48 SATfeatPy global features. Không cần `torch-geometric`.
-- `satfeat_adapter.py` normalize DIMACS trước khi gọi SATfeatPy để tránh lỗi parser với header SATLIB có nhiều khoảng trắng, cache riêng cho SATfeatPy, và tắt local-search probing mặc định vì phần này cần `ubcsat`.
-- Mặc định SmartSAT dùng `LANGSAT_POLICY_MODE=rl` và `LANGSAT_REWARD_MODE=paper` để bám mô tả bài báo hơn: PPO chọn trực tiếp branching action, reward là số clause satisfied trừ unsatisfied.
-- Paper-like reward để `LANGSAT_STEP_PENALTY=0` và `LANGSAT_CONFLICT_PENALTY=0` theo mặc định. Các penalty này chỉ nên bật khi chạy reward-shaping ablation.
+- `satfeat_adapter.py` normalize DIMACS trước khi gọi SATfeatPy để tránh lỗi parser với header SATLIB có nhiều khoảng trắng và cache riêng cho SATfeatPy. Strict reproduction mặc định bật local-search probing (`LANGSAT_SATFEATPY_FULL_LOCAL_SEARCH=1`) để lấy đủ 48 SATzilla features; nếu Kaggle thiếu `ubcsat`, đặt biến này thành `0` chỉ cho diagnostic partial-feature run.
+- Mặc định SmartSAT dùng `LANGSAT_POLICY_MODE=rl`: PPO chọn trực tiếp branching action, reward paper là delta của số clause satisfied trừ unsatisfied nên cumulative episode reward bị chặn bởi final clause score, tối đa 91 trên `uf20-91`.
+- SmartSAT benchmark hiện cố định profile `uf20-91` (20 variables, 91 clauses). CNF khác profile sẽ bị từ chối rõ ràng thay vì âm thầm truncate observation/action space.
 - Baseline dùng CDCL-style search với VSIDS, conflict learning và backtracking. Pure reproduce chỉ dùng Python CDCL; nếu solver vượt budget, hãy tăng `LANGSAT_SOLVER_MAX_SECONDS`, `LANGSAT_SOLVER_MAX_CONFLICTS`, hoặc `LANGSAT_SOLVER_MAX_DECISIONS` thay vì dùng engine khác cho số liệu báo cáo.
 - `evaluate.py` lưu thêm diagnostic metrics như invalid-action rate, policy time per call, decision/conflict ratio SmartSAT-vs-baseline và budget exit rate để giải thích sai lệch reproduction thay vì chỉ nhìn win rate.
-- Kết quả thời gian nên đọc từ raw metrics trước. `LANGSAT_REPORT_SCALE_TO_PAPER` chỉ dùng để tạo bảng hardware-normalized phụ, không thay thế raw runtime.
+- Kết quả thời gian luôn là raw runtime. Repo không còn scale thời gian để khớp mốc paper.
 - `src/end_to_end.py` không còn là entrypoint; end-to-end được tích hợp vào `lang2logic.py` để bám cấu trúc module của repo.
 
 ## Chạy reproduction

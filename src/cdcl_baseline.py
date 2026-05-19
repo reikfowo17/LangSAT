@@ -257,6 +257,35 @@ class CDCLSolver:
         value = 1 if self.literal_bias[var] >= 0 else -1
         return var, value
 
+    def make_decision(self, var: int, value: int):
+        self.current_level += 1
+        self.trail_lim.append(len(self.trail))
+        self._enqueue(var, 1 if value >= 0 else -1, self.current_level, reason=None)
+        self.stats.decisions += 1
+
+    def learn_from_conflict(
+        self,
+        conflict_ci: int,
+        seen_learned: Optional[set[tuple[int, ...]]] = None,
+    ) -> tuple[list[int], int]:
+        learned, backtrack_level = self.analyze_conflict(conflict_ci)
+        key = tuple(sorted(learned))
+        should_add = bool(learned)
+        if seen_learned is not None:
+            should_add = should_add and key not in seen_learned
+        if should_add:
+            self.clauses.append(learned)
+            self.stats.learned_clauses += 1
+            if seen_learned is not None:
+                seen_learned.add(key)
+        reason = len(self.clauses) - 1 if should_add else None
+
+        self.backtrack(backtrack_level)
+        if len(learned) == 1:
+            lit = learned[0]
+            self._enqueue(abs(lit), 1 if lit > 0 else -1, self.current_level, reason)
+        return learned, backtrack_level
+
     def solve(
         self,
         preferred_literals: Optional[list[int]] = None,
@@ -309,17 +338,7 @@ class CDCLSolver:
                 if self.stats.conflicts >= max_conflicts:
                     return None
 
-                learned, backtrack_level = self.analyze_conflict(conflict)
-                key = tuple(sorted(learned))
-                if learned and key not in seen_learned:
-                    self.clauses.append(learned)
-                    seen_learned.add(key)
-                    self.stats.learned_clauses += 1
-
-                self.backtrack(backtrack_level)
-                if len(learned) == 1:
-                    lit = learned[0]
-                    self._enqueue(abs(lit), 1 if lit > 0 else -1, self.current_level, len(self.clauses) - 1)
+                self.learn_from_conflict(conflict, seen_learned)
                 continue
 
             if all(self.assignment[v] != 0 for v in range(1, self.inst.n_vars + 1)):
@@ -330,10 +349,7 @@ class CDCLSolver:
                 return True
 
             var, value, pref_idx = decision
-            self.current_level += 1
-            self.trail_lim.append(len(self.trail))
-            self._enqueue(var, value, self.current_level, reason=None)
-            self.stats.decisions += 1
+            self.make_decision(var, value)
             if self._budget_hit(max_decisions, deadline):
                 return None
 
