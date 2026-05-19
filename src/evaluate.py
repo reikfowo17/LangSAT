@@ -42,6 +42,7 @@ REPORT_SCALE_TO_PAPER = os.environ.get("LANGSAT_REPORT_SCALE_TO_PAPER", "0") == 
 SMARTSAT_POLICY_MODE = os.environ.get("LANGSAT_POLICY_MODE", "rl").lower()
 SMARTSAT_USE_SEARCH_TIME = os.environ.get("LANGSAT_USE_SEARCH_TIME", "0") == "1"
 RUN_PROFILE = "paper_like"
+GRAPH_POLICY_ENABLED = True
 
 
 def _metric_basis() -> str:
@@ -288,7 +289,7 @@ def compute_metrics(df: pd.DataFrame) -> dict:
         "baseline_budget_exits": int(df["baseline_budget_exceeded"].sum()),
         "smartsat_budget_exits": int(df["smartsat_budget_exceeded"].sum()),
         "observation_encoding": "flat_vector_with_signed_clause_variable_matrix",
-        "graph_policy": False,
+        "graph_policy": GRAPH_POLICY_ENABLED,
     }
 
     split_meta = _load_split_metadata()

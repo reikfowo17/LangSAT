@@ -18,6 +18,11 @@ from stable_baselines3.common.monitor import Monitor
 from smartsat_env import SmartSATEnv
 
 try:
+    from .policy import policy_kwargs
+except ImportError:
+    from policy import policy_kwargs
+
+try:
     from sb3_contrib import MaskablePPO
     from sb3_contrib.common.wrappers import ActionMasker
 except Exception:
@@ -41,6 +46,7 @@ SPLIT_SEED     = int(os.environ.get("LANGSAT_SPLIT_SEED", str(SEED)))
 CHECKPOINT_FREQ = 10_000          # Lưu checkpoint mỗi 10k steps
 TRAIN_LOG_INTERVAL = int(os.environ.get("LANGSAT_TRAIN_LOG_INTERVAL", "5000"))
 TRAIN_HEARTBEAT_SECONDS = float(os.environ.get("LANGSAT_TRAIN_HEARTBEAT_SECONDS", "60"))
+GRAPH_POLICY_ENABLED = True
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -109,6 +115,24 @@ def load_and_split_dataset(data_dir: str, train_ratio: float = 0.8):
         json.dump(split_info, f, indent=2)
 
     return train_files, test_files
+
+
+def build_model_kwargs(env) -> dict:
+    return dict(
+        policy="MlpPolicy",
+        env=env,
+        learning_rate=LEARNING_RATE,
+        n_steps=2048,
+        batch_size=64,
+        n_epochs=10,
+        gamma=0.99,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        verbose=0,
+        seed=SEED,
+        tensorboard_log=os.path.join(OUTPUT_DIR, "tb_logs"),
+        policy_kwargs=policy_kwargs(features_dim=128),
+    )
 
 class RewardLoggerCallback(BaseCallback):
     def __init__(
@@ -188,25 +212,12 @@ def train_smartsat(train_files: list[str]) -> tuple:
 
     # PPO model; prefer action masking when sb3-contrib is available.
     model_cls = MaskablePPO if MaskablePPO is not None else PPO
-    model_kwargs = dict(
-        policy="MlpPolicy",
-        env=vec_env,
-        learning_rate=LEARNING_RATE,
-        n_steps=2048,
-        batch_size=64,
-        n_epochs=10,
-        gamma=0.99,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        verbose=0,
-        seed=SEED,
-        tensorboard_log=os.path.join(OUTPUT_DIR, "tb_logs"),
-    )
+    model_kwargs = build_model_kwargs(vec_env)
     if model_cls is MaskablePPO:
-        print("[Train] Using MaskablePPO action masking.")
+        print("[Train] Using MaskablePPO action masking with graph message-passing policy.")
         model = model_cls(**model_kwargs)
     else:
-        print("[Train] sb3-contrib unavailable; falling back to PPO without masking.")
+        print("[Train] sb3-contrib unavailable; using graph policy without action masking.")
         model = model_cls(**model_kwargs)
 
     # Callbacks

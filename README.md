@@ -20,6 +20,7 @@ langsat_reproduce/
 ├── src/
 │   ├── cdcl_baseline.py       ← CDCL solver + VSIDS heuristic
 │   ├── smartsat_env.py        ← Custom Gym environment cho RL agent
+│   ├── policy.py              ← Graph message-passing PPO feature extractor
 │   ├── training_pipeline.py   ← PPO training loop
 │   ├── evaluate.py            ← Win rate + solving time evaluation
 │   └── lang2logic.py          ← NL → CNF pipeline
@@ -75,13 +76,25 @@ Phần benchmark SmartSAT trên `uf20-91` vẫn là thực nghiệm riêng để
 
 ## Ghi chú reproduce
 
-- Đường chạy mặc định là paper-like: reward paper, total solving time, và bắt buộc SATfeatPy. Nếu chỉ smoke test local khi chưa cài SATfeatPy, có thể tạm đặt `LANGSAT_REQUIRE_SATFEATPY=0`, nhưng không dùng kết quả đó để so với bài báo.
+- Đường chạy mặc định là paper-like và nghiêm ngặt: reward paper, total solving time, bắt buộc SATfeatPy, không có feature tự tính thay thế.
 - Split dataset mặc định là `sorted` để giữ tương thích notebook cũ. Có thể đặt `LANGSAT_SPLIT_STRATEGY=shuffled` và `LANGSAT_SPLIT_SEED=42`; metadata được lưu vào `data_split.json`.
-- SmartSAT dùng 48 global SAT features. `satfeatpy` là optional và không được pin trong `requirements.txt` vì Kaggle/PyPI hiện không có wheel phù hợp; nếu người dùng cài được SATfeatPy thủ công thì repo sẽ ưu tiên dùng, còn mặc định `smartsat_env.py` dùng fallback feature tự tính để pipeline vẫn chạy.
-- Paper-like run đặt `LANGSAT_FEATURE_BACKEND=satfeatpy`; nếu SATfeatPy lỗi thì smoke test phải fail thay vì dùng fallback feature. `satfeat_adapter.py` normalize DIMACS trước khi gọi SATfeatPy để tránh lỗi parser với header SATLIB có nhiều khoảng trắng, cache riêng theo backend thật, và tắt local-search probing mặc định vì phần này cần `ubcsat`.
+- SmartSAT dùng 48 global SAT features từ SATfeatPy/SATzilla. Cần clone SATfeatPy và set `LANGSAT_SATFEATPY_DIR`; nếu thiếu hoặc lỗi, training/evaluation sẽ dừng.
+- SmartSAT policy mặc định dùng `SmartSATGraphExtractor` trong `src/policy.py`: PyTorch bipartite message passing trên signed clause-variable graph, fuse với assignment state, clause state và 48 SATfeatPy global features. Không cần `torch-geometric`.
+- `satfeat_adapter.py` normalize DIMACS trước khi gọi SATfeatPy để tránh lỗi parser với header SATLIB có nhiều khoảng trắng, cache riêng cho SATfeatPy, và tắt local-search probing mặc định vì phần này cần `ubcsat`.
 - Mặc định SmartSAT dùng `LANGSAT_POLICY_MODE=rl` và `LANGSAT_REWARD_MODE=paper` để bám mô tả bài báo hơn: PPO chọn trực tiếp branching action, reward là số clause satisfied trừ unsatisfied.
 - Paper-like reward để `LANGSAT_STEP_PENALTY=0` và `LANGSAT_CONFLICT_PENALTY=0` theo mặc định. Các penalty này chỉ nên bật khi chạy reward-shaping ablation.
-- Baseline dùng CDCL-style search với VSIDS, conflict learning và backtracking. Để tránh Kaggle treo ở một instance khó, solver có budget qua `LANGSAT_SOLVER_MAX_SECONDS`, `LANGSAT_SOLVER_MAX_CONFLICTS`, `LANGSAT_SOLVER_MAX_DECISIONS`; khi vượt budget repo có thể fallback sang PySAT `Minisat22` để xác nhận SAT/UNSAT. Với paper-like metrics, đặt `LANGSAT_PYSAT_TIME_MODE=budget` để thời gian report là thời gian Python CDCL trước fallback, không phải thời gian Minisat22.
+- Baseline dùng CDCL-style search với VSIDS, conflict learning và backtracking. Pure reproduce chỉ dùng Python CDCL; nếu solver vượt budget, hãy tăng `LANGSAT_SOLVER_MAX_SECONDS`, `LANGSAT_SOLVER_MAX_CONFLICTS`, hoặc `LANGSAT_SOLVER_MAX_DECISIONS` thay vì dùng engine khác cho số liệu báo cáo.
 - `evaluate.py` lưu thêm diagnostic metrics như invalid-action rate, policy time per call, decision/conflict ratio SmartSAT-vs-baseline và budget exit rate để giải thích sai lệch reproduction thay vì chỉ nhìn win rate.
 - Kết quả thời gian nên đọc từ raw metrics trước. `LANGSAT_REPORT_SCALE_TO_PAPER` chỉ dùng để tạo bảng hardware-normalized phụ, không thay thế raw runtime.
 - `src/end_to_end.py` không còn là entrypoint; end-to-end được tích hợp vào `lang2logic.py` để bám cấu trúc module của repo.
+
+## Chạy reproduction
+
+```powershell
+git clone https://github.com/bprovanbessell/SATfeatPy.git D:\tools\SATfeatPy
+$env:LANGSAT_SATFEATPY_DIR="D:\tools\SATfeatPy"
+python src\training_pipeline.py
+python src\evaluate.py
+```
+
+Trên Kaggle, dùng notebook `notebooks/LangSAT_Kaggle_Reproduce.ipynb`; cell đầu đã clone repo, clone SATfeatPy và set các biến môi trường cần thiết.
