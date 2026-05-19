@@ -96,3 +96,13 @@ class TrueGNNSATExtractor(BaseFeaturesExtractor):
         # Nối với 48 Đặc trưng toàn cục và xuất ra vector cuối cùng cho PPO
         fused = torch.cat([graph_var_repr, graph_clause_repr, global_feats], dim=-1)
         return self.final_proj(fused)
+
+
+def policy_kwargs(features_dim: int = 128) -> dict:
+    return {
+        "features_extractor_class": TrueGNNSATExtractor,
+        "features_extractor_kwargs": {
+            "features_dim": features_dim,
+            "n_global": 48,
+        },
+    }
