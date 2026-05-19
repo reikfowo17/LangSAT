@@ -95,7 +95,6 @@ class SmartSATEnv(gym.Env):
         self.preferred_literals: list[int] = []
         self._baseline_decisions = N_VARS
         self._invalid_actions = 0
-        self._fallback_actions = 0
         self._last_action_mask = np.ones(N_VARS * 2, dtype=np.int8)
 
     # ---- Helpers ----
@@ -161,7 +160,6 @@ class SmartSATEnv(gym.Env):
         self._step_count = 0
         self.preferred_literals = []
         self._invalid_actions = 0
-        self._fallback_actions = 0
 
         # Unit propagation ban đầu (level 0)
         self._solver._find_initial_units()
@@ -182,19 +180,11 @@ class SmartSATEnv(gym.Env):
         var     = var_idx + 1
         invalid_action = var_idx < 0 or var_idx >= N_VARS or solver.assignment[var] != 0
 
-        # Invalid policy actions are penalized and replaced by the baseline
-        # branching heuristic so training can still continue.
         if invalid_action:
             self._invalid_actions += 1
-            fallback = solver.pick_branching_variable()
-            if fallback is None:
-                # Tất cả biến đã gán → kết thúc
-                sat = self._check_sat()
-                reward = self._terminal_reward(sat)
-                self._done = True
-                return self._get_obs(), reward, True, False, self._info(sat=sat)
-            self._fallback_actions += 1
-            var, value = fallback
+            self._done = True
+            reward = -float(N_CLAUSES + self._step_count) - INVALID_ACTION_PENALTY
+            return self._get_obs(), reward, True, False, self._info(invalid_action=True)
 
         lit = var if value == 1 else -var
         if lit not in self.preferred_literals and -lit not in self.preferred_literals:
@@ -210,8 +200,6 @@ class SmartSATEnv(gym.Env):
         conflict_ci = solver.unit_propagate()
 
         self._step_count += 1
-        terminated = False
-        truncated  = False
 
         if conflict_ci is not None:
             if solver.current_level == 0:
@@ -243,8 +231,6 @@ class SmartSATEnv(gym.Env):
             return self._get_obs(), self._terminal_reward(True), True, False, self._info(sat=True)
 
         reward = self._compute_reward() - STEP_PENALTY - (CONFLICT_PENALTY if conflict_ci is not None else 0.0)
-        if invalid_action:
-            reward -= INVALID_ACTION_PENALTY
 
         # Truncation: episode quá dài → dừng lại
         if self._step_count >= self._max_steps:
@@ -253,17 +239,23 @@ class SmartSATEnv(gym.Env):
         self._last_action_mask = self._compute_action_mask()
         return self._get_obs(), reward, False, False, {}
 
-    def _info(self, sat: Optional[bool] = None, truncated: bool = False) -> dict:
+    def _info(
+        self,
+        sat: Optional[bool] = None,
+        truncated: bool = False,
+        invalid_action: bool = False,
+    ) -> dict:
         info = {
             "steps": self._step_count,
             "invalid_actions": self._invalid_actions,
-            "fallback_actions": self._fallback_actions,
             "preferred_literals": list(self.preferred_literals),
         }
         if sat is not None:
             info["sat"] = sat
         if truncated:
             info["truncated"] = True
+        if invalid_action:
+            info["invalid_action"] = True
         return info
 
     def _check_sat(self) -> bool:

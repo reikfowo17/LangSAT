@@ -4,21 +4,16 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from typing import Iterable
 
 import numpy as np
-
-from cdcl_baseline import SATInstance
 
 
 N_SATZILLA_FEATURES = 48
 SATFEATPY_DIR = os.environ.get("LANGSAT_SATFEATPY_DIR", "").strip()
-FEATURE_BACKEND = os.environ.get("LANGSAT_FEATURE_BACKEND", "auto").lower()
 FEATURE_CACHE_DIR = os.environ.get("LANGSAT_FEATURE_CACHE_DIR", "").strip()
 SATFEATPY_FULL_LOCAL_SEARCH = os.environ.get("LANGSAT_SATFEATPY_FULL_LOCAL_SEARCH", "0") == "1"
-REQUIRE_SATFEATPY = os.environ.get("LANGSAT_REQUIRE_SATFEATPY", "1") == "1"
 _BACKEND_NOTICE_PRINTED: set[str] = set()
-BACKEND_USAGE = {"satfeatpy": 0, "fallback": 0, "cache": 0}
+BACKEND_USAGE = {"satfeatpy": 0, "cache": 0}
 CACHE_VERSION = "satfeat-v2"
 
 
@@ -75,54 +70,23 @@ SATZILLA_FEATURE_ORDER = [
 
 
 def extract_sat_features(filepath: str, n_features: int = N_SATZILLA_FEATURES) -> np.ndarray:
-    backend = FEATURE_BACKEND
-    if backend not in {"auto", "satfeatpy", "fallback"}:
-        _notice_once("backend", f"[Features] Unknown LANGSAT_FEATURE_BACKEND={backend!r}; using auto.")
-        backend = "auto"
-
-    if backend == "fallback":
-        if REQUIRE_SATFEATPY:
-            raise RuntimeError("SATfeatPy is required for this run; fallback feature backend is disabled.")
-        cached = _read_cache(filepath, "fallback", n_features)
-        if cached is not None:
-            return cached
-        _notice_once("fallback_forced", "[Features] Using local fallback features.")
-        arr = _normalize(_extract_fallback_features(filepath, n_features), n_features)
-        BACKEND_USAGE["fallback"] += 1
-        _write_cache(filepath, "fallback", n_features, arr)
-        return arr
-
     cached = _read_cache(filepath, "satfeatpy", n_features)
     if cached is not None:
         return cached
 
-    try:
-        arr = _normalize(_extract_with_satfeatpy(filepath, n_features), n_features)
-        BACKEND_USAGE["satfeatpy"] += 1
-        _notice_once("satfeatpy", "[Features] Using SATfeatPy/SATzilla-style global features.")
-        _write_cache(filepath, "satfeatpy", n_features, arr)
-        return arr
-    except Exception as exc:
-        if backend == "satfeatpy" or REQUIRE_SATFEATPY:
-            raise
-        _notice_once(
-            "fallback",
-            f"[Features] SATfeatPy unavailable or incomplete ({type(exc).__name__}: {exc}); using local fallback features.",
-        )
-        cached = _read_cache(filepath, "fallback", n_features)
-        if cached is not None:
-            return cached
-        arr = _normalize(_extract_fallback_features(filepath, n_features), n_features)
-        BACKEND_USAGE["fallback"] += 1
-        _write_cache(filepath, "fallback", n_features, arr)
-        return arr
+    arr = _normalize(_extract_with_satfeatpy(filepath, n_features), n_features)
+    BACKEND_USAGE["satfeatpy"] += 1
+    _notice_once("satfeatpy", "[Features] Using SATfeatPy/SATzilla-style global features.")
+    _write_cache(filepath, "satfeatpy", n_features, arr)
+    return arr
 
 
 def _extract_with_satfeatpy(filepath: str, n_features: int) -> np.ndarray:
-    if not SATFEATPY_DIR:
+    satfeat_root = os.environ.get("LANGSAT_SATFEATPY_DIR", SATFEATPY_DIR).strip()
+    if not satfeat_root:
         raise RuntimeError("LANGSAT_SATFEATPY_DIR is not set")
 
-    satfeat_dir = Path(SATFEATPY_DIR)
+    satfeat_dir = Path(satfeat_root)
     if not satfeat_dir.exists():
         raise FileNotFoundError(f"SATfeatPy directory not found: {satfeat_dir}")
 
@@ -174,80 +138,6 @@ def _normalized_dimacs_copy(filepath: str) -> str:
                 continue
             out.write(" ".join(parts) + "\n")
     return out_path
-
-
-def _extract_fallback_features(filepath: str, n_features: int) -> np.ndarray:
-    inst = SATInstance.from_dimacs(filepath)
-    pos = np.zeros(inst.n_vars + 1, dtype=np.float32)
-    neg = np.zeros(inst.n_vars + 1, dtype=np.float32)
-    clause_lengths = []
-    horn_count = 0
-    binary_count = 0
-    ternary_count = 0
-    clause_balance = []
-
-    for clause in inst.clauses:
-        clause_lengths.append(len(clause))
-        n_pos = 0
-        n_neg = 0
-        for lit in clause:
-            if lit > 0:
-                pos[lit] += 1
-                n_pos += 1
-            else:
-                neg[-lit] += 1
-                n_neg += 1
-        if n_pos <= 1:
-            horn_count += 1
-        if len(clause) == 2:
-            binary_count += 1
-        if len(clause) == 3:
-            ternary_count += 1
-        denom = max(n_pos + n_neg, 1)
-        clause_balance.append(2.0 * abs(0.5 - (n_pos / denom)))
-
-    total_lits = float(sum(clause_lengths) or 1)
-    n_clauses = float(inst.n_clauses or 1)
-    occurrences = pos[1:] + neg[1:]
-    var_balance = np.zeros(max(inst.n_vars, 1), dtype=np.float32)
-    if inst.n_vars > 0:
-        denom = np.maximum(occurrences, 1.0)
-        var_balance = 2.0 * np.abs(0.5 - (pos[1:] / denom))
-
-    base_values = [
-        inst.n_clauses,
-        inst.n_vars,
-        inst.n_clauses / max(inst.n_vars, 1),
-        *_stats(occurrences / n_clauses),
-        _entropy(occurrences),
-        *_stats(np.array(clause_lengths, dtype=np.float32) / max(inst.n_vars, 1)),
-        _entropy(clause_lengths),
-        *_stats(occurrences / n_clauses),
-        *_stats(clause_balance)[:2],
-        _entropy_continuous(clause_balance),
-        *_stats(var_balance),
-        _entropy_continuous(var_balance),
-        binary_count / n_clauses,
-        (binary_count + ternary_count) / n_clauses,
-        ternary_count / n_clauses,
-        horn_count / n_clauses,
-        *_stats(occurrences / n_clauses),
-        _entropy(occurrences),
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-    ]
-    return np.array(base_values[:n_features], dtype=np.float32)
 
 
 def _normalize(arr: np.ndarray, n_features: int) -> np.ndarray:
@@ -313,37 +203,6 @@ def _safe_feature_value(value) -> float:
     if not np.isfinite(value):
         return 0.0
     return value
-
-
-def _stats(values: Iterable[float]) -> tuple[float, float, float, float]:
-    arr = np.array(list(values), dtype=np.float32)
-    if arr.size == 0:
-        return 0.0, 0.0, 0.0, 0.0
-    mean = float(np.mean(arr))
-    std = float(np.std(arr))
-    coeff = std / abs(mean) if abs(mean) > 1e-12 else 0.0
-    return mean, coeff, float(np.min(arr)), float(np.max(arr))
-
-
-def _entropy(values: Iterable[float]) -> float:
-    arr = np.array(list(values), dtype=np.float32)
-    if arr.size == 0:
-        return 0.0
-    _, counts = np.unique(arr, return_counts=True)
-    probs = counts.astype(np.float32) / float(np.sum(counts))
-    return float(-np.sum(probs * np.log2(probs + 1e-12)))
-
-
-def _entropy_continuous(values: Iterable[float], bins: int = 10) -> float:
-    arr = np.array(list(values), dtype=np.float32)
-    if arr.size == 0:
-        return 0.0
-    counts, _ = np.histogram(arr, bins=bins)
-    counts = counts[counts > 0]
-    if counts.size == 0:
-        return 0.0
-    probs = counts.astype(np.float32) / float(np.sum(counts))
-    return float(-np.sum(probs * np.log2(probs + 1e-12)))
 
 
 def _notice_once(key: str, message: str):
