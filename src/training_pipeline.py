@@ -6,6 +6,7 @@ import json
 import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
+from policy import SmartSATExtractor
 
 # Thêm src vào path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -201,6 +202,12 @@ def train_smartsat(train_files: list[str]) -> tuple:
         verbose=0,
         seed=SEED,
         tensorboard_log=os.path.join(OUTPUT_DIR, "tb_logs"),
+        #### Phần thêm GNN
+        policy_kwargs=dict(
+            features_extractor_class=SmartSATExtractor,
+            features_extractor_kwargs=dict(features_dim=128)
+        )
+        ####
     )
     if model_cls is MaskablePPO:
         print("[Train] Using MaskablePPO action masking.")
