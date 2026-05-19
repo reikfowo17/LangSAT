@@ -68,4 +68,31 @@ class TrueGNNSATExtractor(BaseFeaturesExtractor):
         E_neg = torch.relu(-graph_matrix) 
         
         # --- BƯỚC 2: KHỞI TẠO ĐỈNH (INIT NODES) ---
-        # Khởi tạo vector nhúng
+        # Khởi tạo vector nhúng cho Biến dương (L), Biến âm (~L) và Mệnh đề (C)
+        L_pos = self.var_emb(var_status)             # (Batch, N, Hidden)
+        L_neg = self.var_emb(-var_status)            # (Batch, N, Hidden)
+        C = self.clause_emb(clause_status)           # (Batch, M, Hidden)
+        
+        # --- BƯỚC 3: LAN TRUYỀN THÔNG ĐIỆP (MESSAGE PASSING) ---
+        for _ in range(self.gnn_iters):
+            # Nhịp 1: L -> C (Biến gửi thông tin cho Mệnh đề)
+            # torch.bmm là nhân ma trận theo lô (Batch Matrix Multiplication)
+            msg_to_C = torch.bmm(E_pos, L_pos) + torch.bmm(E_neg, L_neg)
+            C = self.clause_update(msg_to_C)
+            
+            # Nhịp 2: C -> L (Mệnh đề phản hồi lại cho Biến)
+            msg_to_L_pos = torch.bmm(E_pos.transpose(1, 2), C)
+            msg_to_L_neg = torch.bmm(E_neg.transpose(1, 2), C)
+            
+            # Nhịp 3: Cập nhật Biến + Trao đổi chéo (Flip L <-> ~L)
+            L_pos = self.var_update(torch.cat([msg_to_L_pos, L_neg], dim=-1))
+            L_neg = self.var_update(torch.cat([msg_to_L_neg, L_pos], dim=-1))
+            
+        # --- BƯỚC 4: GỘP THÔNG TIN (GLOBAL POOLING) ---
+        # Lấy trung bình tất cả các Biến và Mệnh đề để tạo ra "Bức tranh toàn cảnh"
+        graph_var_repr = L_pos.mean(dim=1)     # (Batch, Hidden)
+        graph_clause_repr = C.mean(dim=1)      # (Batch, Hidden)
+        
+        # Nối với 48 Đặc trưng toàn cục và xuất ra vector cuối cùng cho PPO
+        fused = torch.cat([graph_var_repr, graph_clause_repr, global_feats], dim=-1)
+        return self.final_proj(fused)
