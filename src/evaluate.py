@@ -69,10 +69,14 @@ def _predict_action(model, obs, action_masks=None):
 
 
 def solve_with_smartsat(filepath: str, model: PPO) -> tuple[bool, float, dict]:
+    t_total_start = time.perf_counter()
+
     inst = SATInstance.from_dimacs(filepath)
     validate_uf20_91_instance(inst, filepath)
     solver = CDCLSolver(inst)
+    feature_start = time.perf_counter()
     global_features = extract_sat_features(filepath)
+    feature_elapsed = time.perf_counter() - feature_start
     policy_time = 0.0
     rl_decisions = 0
     invalid_decisions = 0
@@ -301,7 +305,6 @@ def compute_metrics(df: pd.DataFrame) -> dict:
     print(f"  Decision ratio ST/BSL: {metrics['median_decision_ratio_st_over_bsl']}x")
     print(f"  Conflict ratio ST/BSL: {metrics['median_conflict_ratio_st_over_bsl']}x")
     print(f"  [Bài báo gốc]        : ~53% win rate, ~1.02s median")
-    print("="*55)
 
     # So sánh với bài báo
     print(f"  Raw Median SmartSAT  : {metrics['median_smartsat_raw']}s")

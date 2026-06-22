@@ -5,10 +5,6 @@ from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from gymnasium import spaces
 
 class TrueGNNSATExtractor(BaseFeaturesExtractor):
-    """
-    Kiến trúc Bipartite GNN chuẩn mực cho bài toán SAT (Lấy cảm hứng từ NeuroSAT).
-    Thực hiện Message Passing giữa Đỉnh Biến (Variables) và Đỉnh Mệnh đề (Clauses).
-    """
     def __init__(self, observation_space: spaces.Box, features_dim: int = 128, 
                  n_vars: int = 20, n_clauses: int = 91, n_global: int = 48, gnn_iters: int = 3):
         

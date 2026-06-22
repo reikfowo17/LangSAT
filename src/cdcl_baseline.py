@@ -10,7 +10,6 @@ DEFAULT_MAX_DECISIONS = int(os.environ.get("LANGSAT_SOLVER_MAX_DECISIONS", "2000
 
 
 class SATInstance:
-    """Read and store a DIMACS CNF instance."""
 
     def __init__(self, n_vars: int, clauses: list[list[int]]):
         self.n_vars = n_vars
@@ -39,8 +38,6 @@ class SATInstance:
 
 
 class VSIDS:
-    """A small activity heuristic used for reproducible branching."""
-
     def __init__(self, n_vars: int, decay: float = 0.95):
         self.activity = [0.0] * (n_vars + 1)
         self.decay = decay
@@ -135,13 +132,6 @@ def _backtrack_level(
 
 
 class CDCLSolver:
-    """CDCL-style SAT solver with a pluggable decision policy.
-
-    Baseline uses the built-in VSIDS-style branching. SmartSAT evaluation uses
-    the same search loop and injects the PPO model only at branching decisions,
-    which keeps the comparison focused on the branching heuristic.
-    """
-
     def __init__(self, instance: SATInstance):
         self.inst = instance
         self.assignment = [0] * (instance.n_vars + 1)

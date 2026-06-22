@@ -44,7 +44,6 @@ SATZILLA_FEATURE_ORDER = [
     "pnv_ratio_max",
     "pnv_ratio_entropy",
     "binary_ratio",
-    "ternary+",
     "ternary_ratio",
     "hc_fraction",
     "hc_var_mean",
@@ -58,16 +57,18 @@ SATZILLA_FEATURE_ORDER = [
     "unit_props_at_depth_64",
     "unit_props_at_depth_256",
     "mean_depth_to_contradiction_over_vars",
-    "estimate_log_number_nodes_over_vars",
+    "estimate_log_number_nodes_over_vars"
+]
+LOCAL_SEARCH_FEATURES = [
     "saps_BestSolution_Mean",
-    "saps_FirstLocalMinStep_Median",
-    "saps_FirstLocalMinStep_Q.10",
-    "saps_FirstLocalMinStep_Q.90",
+    "saps_FirstLocalMinStep_Mean",
+    "gsat_BestSolution_Mean",
+    "gsat_FirstLocalMinStep_Mean",
     "saps_BestAvgImprovement_Mean",
     "saps_FirstLocalMinRatio_Mean",
-    "saps_EstACL_Mean",
+    "gsat_BestAvgImprovement_Mean",
+    "gsat_FirstLocalMinRatio_Mean"
 ]
-LOCAL_SEARCH_FEATURES = SATZILLA_FEATURE_ORDER[41:]
 
 
 def extract_sat_features(filepath: str, n_features: int = N_SATZILLA_FEATURES) -> np.ndarray:

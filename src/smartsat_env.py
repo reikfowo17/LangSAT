@@ -98,7 +98,6 @@ class SmartSATEnv(gym.Env):
         self.preferred_literals: list[int] = []
         self._invalid_actions = 0
         self._last_action_mask = np.ones(N_VARS * 2, dtype=np.int8)
-        self._last_clause_score = 0.0
 
     # ---- Helpers ----
 
@@ -138,13 +137,10 @@ class SmartSATEnv(gym.Env):
         return float(satisfied - unsatisfied)
 
     def _compute_reward(self) -> float:
-        score = self._clause_score()
-        reward = score - self._last_clause_score
-        self._last_clause_score = score
-        return reward
+        return self._clause_score()
 
     def _terminal_reward(self, sat: bool) -> float:
-        return self._compute_reward() if sat else -float(N_CLAUSES)
+        return self._compute_reward()
 
     # ---- Gym Interface ----
 
@@ -162,7 +158,6 @@ class SmartSATEnv(gym.Env):
 
         # Unit propagation ban đầu (level 0)
         self._solver._find_initial_units()
-        self._last_clause_score = self._clause_score()
         self._last_action_mask = self._compute_action_mask()
 
         obs = self._get_obs()
