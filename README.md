@@ -4,7 +4,7 @@
   </a>
 </p>
 
-<h1 align="center"><b>CS106 - LangSAT Reproduction Project</b></h1>
+<h1 align="center"><b>CS106 - LangSAT Reproduce Project</b></h1>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=for-the-badge" />
